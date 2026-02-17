@@ -1,90 +1,218 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, Twist
-from std_msgs.msg import Bool
-import time
+from std_msgs.msg import Bool, Float32
+from std_srvs.srv import SetBool
 import math
 
 
 class BallChaser(Node):
+
     def __init__(self):
         super().__init__('ball_chaser')
 
-        self.subscription = self.create_subscription(
+        # =====================================================
+        # DECLARE PARAMETERS (Loaded From robot_config.yaml)
+        # =====================================================
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('arm_raised_deg', 252.0),
+                ('arm_lowered_deg', 177.0),
+                ('target_dist', 0.35),
+                ('tilt_start_dist', 0.8),
+            ]
+        )
+
+        # =====================================================
+        # LOAD PARAMETERS
+        # =====================================================
+        self.ARM_HORIZONTAL = self.get_parameter('arm_raised_deg').value
+        self.ARM_MAX_TILT = self.get_parameter('arm_lowered_deg').value
+
+        self.target_dist = self.get_parameter('target_dist').value
+        self.tilt_start_dist = self.get_parameter('tilt_start_dist').value
+
+        # =====================================================
+        # SUBSCRIBERS / PUBLISHERS
+        # =====================================================
+        self.sub_cam = self.create_subscription(
             Point,
             '/tennis_ball_position',
             self.listener_callback,
-            10)
+            10
+        )
 
-        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.signal_pub = self.create_publisher(Bool, '/ball_ready', 10)
+        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pub_arm = self.create_publisher(Float32, '/arm_command', 10)
+        self.pub_signal = self.create_publisher(Bool, '/ball_ready', 10)
 
-        # --- TUNING PARAMETERS ---
-        self.target_dist = 0.8
-        self.kP_dist = 0.5
-        self.kP_turn = 2.0
+        # =====================================================
+        # SERVICES
+        # =====================================================
+        self.srv_start = self.create_service(
+            SetBool,
+            'start_chasing',
+            self.handle_start
+        )
 
-        self.max_speed = 0.3
-        self.max_turn = 1.0
-        self.dist_tolerance = 0.05
-        self.center_tolerance = 0.05
+        self.srv_stop = self.create_service(
+            SetBool,
+            'stop_chasing',
+            self.handle_stop
+        )
 
-        self.last_msg_time = time.time()
-        self.timer = self.create_timer(0.1, self.watchdog_callback)
+        # =====================================================
+        # STATE
+        # =====================================================
+        self.is_active = False
+        self.arm_angle = self.ARM_HORIZONTAL
 
-        self.get_logger().info("Ball Chaser Node Started.")
+        self.get_logger().info(
+            f"Ball Chaser Ready | Horizontal: {self.ARM_HORIZONTAL} | "
+            f"Max Tilt: {self.ARM_MAX_TILT}"
+        )
 
+    # =====================================================
+    # SERVICE HANDLERS
+    # =====================================================
+    def handle_start(self, request, response):
+
+        self.is_active = request.data
+
+        if self.is_active:
+            self.publish_arm_angle(self.ARM_HORIZONTAL)
+            msg = "Chasing Started!"
+        else:
+            self.publish_arm_angle(self.ARM_HORIZONTAL)
+            self.stop_robot()
+            msg = "Chasing Stopped."
+
+        self.get_logger().info(msg)
+        response.success = True
+        response.message = msg
+        return response
+
+    def handle_stop(self, request, response):
+        return self.handle_start(request, response)
+
+    # =====================================================
+    # ARM COMMAND PUBLISHER
+    # =====================================================
+    def publish_arm_angle(self, angle):
+        self.arm_angle = angle
+        msg = Float32()
+        msg.data = float(angle)
+        self.pub_arm.publish(msg)
+
+    # =====================================================
+    # MAIN CONTROL LOOP
+    # =====================================================
     def listener_callback(self, msg):
-        self.last_msg_time = time.time()
-        cmd = Twist()
 
-        # --- FIX 1: Filter Invalid Data ---
-        # If z is NaN or exactly 0, the camera sees nothing.
-        if math.isnan(msg.z) or msg.z == 0.0:
-            # Stop and do nothing
-            self.publisher_.publish(cmd)
+        if not self.is_active:
             return
 
-        # --- Distance Control ---
-        distance_error = msg.z - self.target_dist
+        cmd = Twist()
 
-        if distance_error > self.dist_tolerance:
-            cmd.linear.x = self.kP_dist * distance_error
-        elif distance_error < -self.dist_tolerance:
-            cmd.linear.x = self.kP_dist * distance_error
+        # -------------------------------------
+        # Sanity Check
+        # -------------------------------------
+        if math.isnan(msg.z) or msg.z <= 0.0:
+            self.stop_robot()
+            return
+
+        # -------------------------------------
+        # Real Distance Compensation
+        # -------------------------------------
+        pitch_deg = self.ARM_HORIZONTAL - self.arm_angle
+        pitch_rad = math.radians(pitch_deg)
+
+        real_dist = msg.z * math.cos(pitch_rad)
+
+        # -------------------------------------
+        # Tilt Logic
+        # -------------------------------------
+        if real_dist < self.tilt_start_dist:
+
+            ratio = (
+                (real_dist - self.target_dist) /
+                (self.tilt_start_dist - self.target_dist)
+            )
+
+            ratio = max(0.0, min(1.0, ratio))
+
+            # Interpolate between horizontal and max tilt
+            new_angle = self.ARM_MAX_TILT + (
+                ratio * (self.ARM_HORIZONTAL - self.ARM_MAX_TILT)
+            )
+
+            self.publish_arm_angle(new_angle)
+
         else:
-            # Inside the target zone
+            self.publish_arm_angle(self.ARM_HORIZONTAL)
+
+        # -------------------------------------
+        # Linear Motion
+        # -------------------------------------
+        err_dist = real_dist - self.target_dist
+
+        # Define distance tolerance
+        dist_tol = 0.05
+        center_tol = 0.05
+
+        if abs(err_dist) > dist_tol:
+            # Still too far → move forward/back
+            cmd.linear.x = 0.5 * err_dist
+
+            # Allow strafing while approaching
+            cmd.linear.y = -1.0 * msg.x
+
+        else:
+            # ✅ We are within target distance → FULL STOP
             cmd.linear.x = 0.0
-
-            # --- FIX 2: Continuous Signaling ---
-            # Only signal if we are also centered
-            if abs(msg.x) < self.center_tolerance:
-                msg_signal = Bool()
-                msg_signal.data = True
-                self.signal_pub.publish(msg_signal)
-                # We removed "self.signal_sent" check so it repeats!
-
-        # --- Orientation Control ---
-        if abs(msg.x) > self.center_tolerance:
-            cmd.angular.z = -1.0 * self.kP_turn * msg.x
-        else:
+            cmd.linear.y = 0.0
             cmd.angular.z = 0.0
 
-        # --- Safety Clamping ---
-        cmd.linear.x = max(min(cmd.linear.x, self.max_speed), -self.max_speed)
-        cmd.angular.z = max(min(cmd.angular.z, self.max_turn), -self.max_turn)
+            # Only signal grab if centered
+            if abs(msg.x) < center_tol:
+                self.pub_signal.publish(Bool(data=True))
 
-        self.publisher_.publish(cmd)
+        # # -------------------------------------
+        # # Angular Motion
+        # # -------------------------------------
+        # cmd.angular.z = -2.0 * msg.x
+        #
+        # # -------------------------------------
+        # # Safety Clamps
+        # # -------------------------------------
+        # cmd.linear.x = max(-0.3, min(0.3, cmd.linear.x))
+        # cmd.angular.z = max(-1.0, min(1.0, cmd.angular.z))
 
-    def watchdog_callback(self):
-        if time.time() - self.last_msg_time > 1.0:
-            stop_msg = Twist()
-            self.publisher_.publish(stop_msg)
+        # -------------------------------------
+        # Safety Clamps
+        # -------------------------------------
+        cmd.linear.x = max(-0.3, min(0.3, cmd.linear.x))
+        cmd.linear.y = max(-0.3, min(0.3, cmd.linear.y))  # Clamp Strafe speed
+        # cmd.angular.z is 0, so no clamp needed really
+
+        self.pub_cmd.publish(cmd)
+
+    # =====================================================
+    # STOP ROBOT
+    # =====================================================
+    def stop_robot(self):
+        self.pub_cmd.publish(Twist())
 
 
+# =====================================================
+# MAIN
+# =====================================================
 def main(args=None):
     rclpy.init(args=args)
     node = BallChaser()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

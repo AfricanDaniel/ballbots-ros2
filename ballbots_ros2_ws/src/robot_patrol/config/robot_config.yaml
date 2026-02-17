@@ -1,0 +1,22 @@
+# robot_config.yaml
+/**:
+  ros__parameters:
+    # --- Hardware Settings ---
+    device_name: '/dev/ttyUSB0'
+    baudrate: 57600
+    arm_id: 0
+    claw_id: 1
+
+    # --- Servo Physical Limits (Degrees) ---
+    # 252.0 = Horizontal (Arm Up)
+    # 177.0 = Vertical (Arm Down / Camera looking at floor)
+    arm_raised_deg: 262.0
+    arm_lowered_deg: 177.0
+
+    # --- Claw Positions ---
+    claw_open_deg: 153.0
+    claw_closed_deg: 173.0
+
+    # --- Tracking Behavior ---
+    target_dist: 0.35       # Stop when ball is 0.35m away
+    tilt_start_dist: 0.8    # Start tilting arm down at 0.8m

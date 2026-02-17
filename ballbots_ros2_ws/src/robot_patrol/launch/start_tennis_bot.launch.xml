@@ -3,11 +3,11 @@
   <!-- ============================= -->
   <!-- Arguments -->
   <!-- ============================= -->
-  <arg
-    name="use_servo"
-    default="true"
-    description="Launch servo_control node"
-  />
+  <arg name="use_servo" default="true"/>
+
+  <!-- Shared Config File -->
+  <let name="config_file"
+       value="$(find-pkg-share robot_patrol)/config/robot_config.yaml"/>
 
   <!-- ============================= -->
   <!-- Minimec Bringup -->
@@ -24,8 +24,10 @@
     pkg="robot_patrol"
     exec="ball_chaser"
     name="ball_chaser"
-    output="screen"
-  />
+    output="screen">
+
+    <param from="$(var config_file)"/>
+  </node>
 
   <!-- ============================= -->
   <!-- Optional Servo Control -->
@@ -35,7 +37,9 @@
     exec="servo_control"
     name="servo_control"
     output="screen"
-    if="$(var use_servo)"
-  />
+    if="$(var use_servo)">
+
+    <param from="$(var config_file)"/>
+  </node>
 
 </launch>

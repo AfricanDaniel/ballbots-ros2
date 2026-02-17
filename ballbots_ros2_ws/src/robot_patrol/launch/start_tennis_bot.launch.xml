@@ -1,0 +1,41 @@
+<launch>
+
+  <!-- ============================= -->
+  <!-- Arguments -->
+  <!-- ============================= -->
+  <arg
+    name="use_servo"
+    default="true"
+    description="Launch servo_control node"
+  />
+
+  <!-- ============================= -->
+  <!-- Minimec Bringup -->
+  <!-- ============================= -->
+  <include
+    file="$(find-pkg-share minimec_bringup)/launch/launch_minimec.launch.py">
+    <arg name="cmd_src" value="teleop"/>
+  </include>
+
+  <!-- ============================= -->
+  <!-- Ball Chaser -->
+  <!-- ============================= -->
+  <node
+    pkg="robot_patrol"
+    exec="ball_chaser"
+    name="ball_chaser"
+    output="screen"
+  />
+
+  <!-- ============================= -->
+  <!-- Optional Servo Control -->
+  <!-- ============================= -->
+  <node
+    pkg="robot_patrol"
+    exec="servo_control"
+    name="servo_control"
+    output="screen"
+    if="$(var use_servo)"
+  />
+
+</launch>

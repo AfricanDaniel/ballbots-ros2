@@ -1,0 +1,119 @@
+cmake_minimum_required(VERSION 3.8)
+project(minimec_control)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+option(BUILD_ROBOT "Build for running on the robot." ON)
+
+# --- COMMENTED OUT FOR MINIMAL ROBOT ---
+# if (NOT BUILD_ROBOT)
+#     set(CMAKE_PREFIX_PATH "/usr/local/lib64/cmake/tinysplinecxx")
+#     find_package(tinysplinecxx REQUIRED)
+# endif()
+
+# find dependencies
+find_package(ament_cmake REQUIRED)
+find_package(Doxygen)
+find_package(rclcpp REQUIRED)
+find_package(minimeclib REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(minimec_msgs REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+# find_package(Armadillo REQUIRED)  <-- Commented out (used for trajectory tracking)
+find_package(visualization_msgs REQUIRED)
+
+# include_directories(${ARMADILLO_INCLUDE_DIRS}) <-- Commented out
+
+# --- ESSENTIAL NODES (KEEP THESE) ---
+add_executable(kinematics src/kinematics.cpp)
+target_link_libraries(kinematics PUBLIC
+        ${geometry_msgs_TARGETS}
+        ${minimec_msgs_TARGETS}
+        rclcpp::rclcpp
+        minimeclib::minimeclib
+)
+
+add_executable(odometry src/odometry.cpp)
+target_link_libraries(odometry PUBLIC
+        ${geometry_msgs_TARGETS}
+        ${nav_msgs_TARGETS}
+        ${sensor_msgs_TARGETS}
+        rclcpp::rclcpp
+        sensor_msgs::sensor_msgs_library
+        tf2::tf2
+        tf2_geometry_msgs::tf2_geometry_msgs
+        tf2_ros::static_transform_broadcaster_node
+        tf2_ros::tf2_ros
+        minimeclib::minimeclib
+)
+
+# --- OPTIONAL NODES (COMMENTED OUT TO FIX BUILD) ---
+# add_executable(trajectory_tracking src/trajectory_tracking.cpp)
+# ament_target_dependencies(trajectory_tracking rclcpp geometry_msgs sensor_msgs tf2 tf2_ros nav_msgs tf2_geometry_msgs)
+# target_link_libraries(trajectory_tracking ${ARMADILLO_LIBRARIES})
+
+# if (NOT BUILD_ROBOT)
+#     add_executable(path_generator src/path_generator.cpp)
+#     ament_target_dependencies(path_generator rclcpp minimec_msgs visualization_msgs tf2)
+#     target_link_libraries(path_generator ${TINYSPLINECXX_LIBRARIES})
+# endif()
+
+install(TARGETS
+        kinematics
+        odometry
+        # trajectory_tracking  <-- Removed from install
+        DESTINATION lib/${PROJECT_NAME})
+
+# if (NOT BUILD_ROBOT)
+#   install(TARGETS
+#   path_generator
+#   DESTINATION lib/${PROJECT_NAME})
+# endif()
+
+# Install launch files.
+install(DIRECTORY
+        launch
+        DESTINATION share/${PROJECT_NAME}/
+)
+
+# Install config files.
+install(DIRECTORY
+        config
+        DESTINATION share/${PROJECT_NAME}/
+)
+
+if(BUILD_TESTING)
+    find_package(ament_lint_auto REQUIRED)
+    # the following line skips the linter which checks for copyrights
+    # comment the line when a copyright and license is added to all source files
+    set(ament_cmake_copyright_FOUND TRUE)
+    # the following line skips cpplint (only works in a git repo)
+    # comment the line when this package is in a git repo and when
+    # a copyright and license is added to all source files
+    set(ament_cmake_cpplint_FOUND TRUE)
+    ament_lint_auto_find_test_dependencies()
+endif()
+
+# Building documentation should be optional.
+# To build documentation pass -DBUILD_DOCS=ON when generating the build system
+option(BUILD_DOCS "Build the documentation" OFF)
+
+# build just because Doxygen is missing
+if(${DOXYGEN_FOUND} AND ${BUILD_DOCS})
+    # Turn the README.md into the homepage of the doxygen docs
+    set(DOXYGEN_USE_MDFILE_AS_MAINPAGE README.md)
+
+    # Tell Doxygen where to find the documentation
+    doxygen_add_docs(doxygen include/ src/ README.md ALL)
+
+    # The documentation will be in the build/html directory
+    # The main page is build/html/index.html
+endif()
+
+ament_package()

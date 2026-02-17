@@ -1,0 +1,12 @@
+.idea
+week_progress
+rosbot2R
+me499_winter_syllabus.pdf
+ballbots_ros2_ws/build/
+ballbots_ros2_ws/install/
+ballbots_ros2_ws/log/
+minimec_ros2_ws
+jetson_ros2_ws/build
+jetson_ros2_ws/install
+jetson_ros2_ws/log
+

@@ -1,0 +1,42 @@
+<launch>
+
+  <!-- ============================= -->
+  <!-- Arguments -->
+  <!-- ============================= -->
+  <arg
+    name="use_rviz"
+    default="false"
+    description="Launch RViz visualization"
+  />
+
+  <!-- ============================= -->
+  <!-- ZED Camera Launch -->
+  <!-- ============================= -->
+  <include
+    file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
+    <arg name="camera_model" value="zed2i"/>
+  </include>
+
+  <!-- ============================= -->
+  <!-- Tennis Ball Tracker Node -->
+  <!-- ============================= -->
+  <node
+    pkg="ball_tracker"
+    exec="tennis_ball_tracker"
+    name="tennis_ball_tracker"
+    output="screen"
+  />
+
+  <!-- ============================= -->
+  <!-- RViz (optional) -->
+  <!-- ============================= -->
+  <node
+    pkg="rviz2"
+    exec="rviz2"
+    name="rviz2"
+    output="screen"
+    if="$(var use_rviz)"
+    args="-d $(find-pkg-share ball_tracker)/config/tennis_visualization.rviz"
+  />
+
+</launch>

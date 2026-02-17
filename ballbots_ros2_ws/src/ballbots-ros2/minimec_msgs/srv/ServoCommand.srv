@@ -1,0 +1,5 @@
+int8 servo_id       # The ID of the servo to move (e.g., 0 or 1)
+float32 delta_degrees # Positive to rotate CW, Negative for CCW
+---
+bool success        # Did it work?
+string message      # Debug info (e.g. "Moved to 90 degrees")

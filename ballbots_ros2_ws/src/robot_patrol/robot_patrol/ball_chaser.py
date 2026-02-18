@@ -34,6 +34,11 @@ class BallChaser(Node):
         self.target_dist = self.get_parameter('target_dist').value
         self.tilt_start_dist = self.get_parameter('tilt_start_dist').value
 
+        self.target_dist = self.declare_parameter(
+            "target_dist", 0.20
+        ).value
+
+        self.grab_started = False
         # =====================================================
         # SUBSCRIBERS / PUBLISHERS
         # =====================================================
@@ -68,6 +73,7 @@ class BallChaser(Node):
         # =====================================================
         self.is_active = False
         self.arm_angle = self.ARM_HORIZONTAL
+        self.claw_opened = False
 
         self.get_logger().info(
             f"Ball Chaser Ready | Horizontal: {self.ARM_HORIZONTAL} | "
@@ -83,6 +89,7 @@ class BallChaser(Node):
 
         if self.is_active:
             self.publish_arm_angle(self.ARM_HORIZONTAL)
+            #self.pub_claw.publish(Float32(data=self.CLAW_OPEN))
             msg = "Chasing Started!"
         else:
             self.publish_arm_angle(self.ARM_HORIZONTAL)
@@ -123,6 +130,22 @@ class BallChaser(Node):
             self.stop_robot()
             return
 
+        # -------------------------------------------------
+        # GRAB PHASE TRANSITION
+        # -------------------------------------------------
+        if msg.z <= self.target_dist:
+            self.get_logger().info("Close enough - initiating grab")
+
+            self.stop_robot()
+
+            # Send grab signal once
+            if not self.grab_started:
+                self.pub_signal.publish(Bool(data=True))
+                self.grab_started = True
+
+            return
+        # -------------------------------------------------
+
         # -------------------------------------
         # Real Distance Compensation
         # -------------------------------------
@@ -136,6 +159,12 @@ class BallChaser(Node):
         # -------------------------------------
         if real_dist < self.tilt_start_dist:
 
+            # Open claw once when we begin tilt phase
+            if not self.claw_opened:
+                self.pub_signal.publish(Bool(data=False))  # optional
+                self.pub_arm.publish(Float32(data=self.ARM_HORIZONTAL))
+                self.claw_opened = True
+
             ratio = (
                 (real_dist - self.target_dist) /
                 (self.tilt_start_dist - self.target_dist)
@@ -144,9 +173,13 @@ class BallChaser(Node):
             ratio = max(0.0, min(1.0, ratio))
 
             # Interpolate between horizontal and max tilt
-            new_angle = self.ARM_MAX_TILT + (
-                ratio * (self.ARM_HORIZONTAL - self.ARM_MAX_TILT)
+            alpha = 0.2  # smoothing factor (0.1–0.3 good range)
+
+            target_angle = self.ARM_MAX_TILT + (
+                    ratio * (self.ARM_HORIZONTAL - self.ARM_MAX_TILT)
             )
+
+            new_angle = self.arm_angle + alpha * (target_angle - self.arm_angle)
 
             self.publish_arm_angle(new_angle)
 

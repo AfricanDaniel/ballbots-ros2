@@ -76,9 +76,9 @@ class TennisBallTracker(Node):
         self.last_timestamp = None
 
         # Validation parameters (only used if ENABLE_VALIDATION = True)
-        self.CIRCULARITY_THRESHOLD = 0.2
-        self.ASPECT_RATIO_THRESHOLD = 0.4
-        self.MIN_DIAMETER_M = 0.03
+        self.CIRCULARITY_THRESHOLD = 0.05
+        self.ASPECT_RATIO_THRESHOLD = 0.2
+        self.MIN_DIAMETER_M = 0.025
         self.MAX_DIAMETER_M = 0.15
         self.DEPTH_STD_THRESHOLD = 0.5
         self.MAX_VELOCITY_MPS = 10.0
@@ -143,8 +143,36 @@ class TennisBallTracker(Node):
 
         # 3. Check physical size using depth
         try:
-            z = float(depth_img[v, u])
-            if z <= 0.0 or z > self.MAX_DETECTION_DISTANCE_M:
+            h, w = depth_img.shape[:2]
+
+            u_min = max(0, u - 2)
+            u_max = min(w, u + 3)
+            v_min = max(0, v - 2)
+            v_max = min(h, v + 3)
+
+            roi = depth_img[v_min:v_max, u_min:u_max]
+            valid = roi[np.isfinite(roi) & (roi > 0)]
+
+            if len(valid) == 0:
+                debug_info['fail_reason'] = 'no_valid_depth'
+                return False, debug_info
+
+            z = float(np.median(valid))
+
+            # ---------------------------------------------
+            # Adaptive thresholds based on distance
+            # ---------------------------------------------
+            if z < 0.25:  # close range
+                circularity_threshold = 0.02
+                aspect_threshold = 0.10
+                min_diameter = 0.015
+            else:
+                circularity_threshold = self.CIRCULARITY_THRESHOLD
+                aspect_threshold = self.ASPECT_RATIO_THRESHOLD
+                min_diameter = self.MIN_DIAMETER_M
+            # ---------------------------------------------
+
+            if not np.isfinite(z) or z <= 0.0 or z > self.MAX_DETECTION_DISTANCE_M:
                 debug_info['fail_reason'] = f'invalid_depth (z={z:.2f}m, max={self.MAX_DETECTION_DISTANCE_M}m)'
                 self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
                 return False, debug_info
@@ -331,9 +359,24 @@ class TennisBallTracker(Node):
                     # Publish TF if depth is available
                     if self.depth_img is not None:
                         try:
-                            z = float(self.depth_img[v, u])
-                            if z == 0.0:  # invalid depth
-                                return
+                            # ----- Robust depth estimation (5x5 median window) -----
+                            h, w = self.depth_img.shape[:2]
+
+                            # Clamp ROI to image bounds
+                            u_min = max(0, u - 2)
+                            u_max = min(w, u + 3)
+                            v_min = max(0, v - 2)
+                            v_max = min(h, v + 3)
+
+                            roi = self.depth_img[v_min:v_max, u_min:u_max]
+
+                            valid = roi[np.isfinite(roi) & (roi > 0)]
+
+                            if len(valid) == 0:
+                                return  # no valid depth nearby
+
+                            z = float(np.median(valid))
+                            # --------------------------------------------------------
                         except Exception as e:
                             self.get_logger().warn(f"Depth read failed: {e}")
                             return

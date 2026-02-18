@@ -126,6 +126,13 @@ class ServoControlNode(Node):
             10
         )
 
+        self.claw_sub = self.create_subscription(
+            Float32,
+            '/claw_command',
+            self.claw_command_callback,
+            10
+        )
+
         # =====================================================
         # SERVICES
         # =====================================================
@@ -207,6 +214,9 @@ class ServoControlNode(Node):
             self.arm_state = "READY"
 
         self.get_logger().info("Grab complete.")
+
+    def claw_command_callback(self, msg):
+        self.move_slowly(self.CLAW_ID, msg.data)
 
     # =====================================================
     # SMOOTH MOVE

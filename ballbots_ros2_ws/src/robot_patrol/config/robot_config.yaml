@@ -18,5 +18,6 @@
     claw_closed_deg: 173.0
 
     # --- Tracking Behavior ---
-    target_dist: 0.35       # Stop when ball is 0.35m away
+    target_dist: 0.2       # Stop when ball is 0.35m away
+    grab_dist: 0.16     # actual claw alignment distance
     tilt_start_dist: 0.8    # Start tilting arm down at 0.8m

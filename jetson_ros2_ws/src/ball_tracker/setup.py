@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'number_publisher = ball_tracker.number_publisher:main',
             'tennis_ball_tracker = ball_tracker.tennis_ball_tracker:main',
+            'realsense_tracker = ball_tracker.realsense_tracker:main',
         ],
     },
 )

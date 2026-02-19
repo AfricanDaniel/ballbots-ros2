@@ -22,8 +22,12 @@ class TennisBallTracker(Node):
         # ============================================================
         # Set to False to accept ALL green blobs (no validation)
         # Set to True to validate shape, size, depth consistency
-        self.ENABLE_VALIDATION = False  # <-- CHANGE THIS LINE
+        self.ENABLE_VALIDATION = True  # <-- CHANGE THIS LINE
         # ============================================================
+
+        # parameters to pull from launch file
+        self.declare_parameter('debug_logs', False)
+        self.debug_logs = self.get_parameter('debug_logs').value
 
         # CV bridge
         self.bridge = CvBridge()
@@ -48,7 +52,7 @@ class TennisBallTracker(Node):
         # Publisher for annotated image with bounding box
         self.annotated_img_pub = self.create_publisher(Image, '/tennis_ball_detection_image', 10)
 
-        # NEW: Publisher for ALL detections (including rejected ones)
+        # Publisher for ALL detections (including rejected ones)
         self.debug_img_pub = self.create_publisher(Image, '/tennis_ball_debug_image', 10)
 
         self.fx = None
@@ -67,11 +71,8 @@ class TennisBallTracker(Node):
         self.odom_set = False
         self.odom_origin = None  # (x, y, z)
 
-        # Timer to print info every 5 seconds
-        self.timer = self.create_timer(5.0, self.print_ball_info)
-
         # Motion tracking for pattern analysis
-        self.position_history = deque(maxlen=10)  # Store last 10 positions
+        self.position_history = deque(maxlen=10)
         self.last_position = None
         self.last_timestamp = None
 
@@ -80,7 +81,7 @@ class TennisBallTracker(Node):
         self.ASPECT_RATIO_THRESHOLD = 0.2
         self.MIN_DIAMETER_M = 0.025
         self.MAX_DIAMETER_M = 0.15
-        self.DEPTH_STD_THRESHOLD = 0.5
+        self.DEPTH_STD_THRESHOLD = 0.7
         self.MAX_VELOCITY_MPS = 10.0
         self.MAX_DETECTION_DISTANCE_M = 15.0
 
@@ -94,7 +95,7 @@ class TennisBallTracker(Node):
     def cam_info_cb(self, msg: CameraInfo):
         """Get camera intrinsics from CameraInfo message"""
         if self.cam_info_received:
-            return  # ignore after first message
+            return
 
         self.fx = msg.k[0]
         self.fy = msg.k[4]
@@ -102,12 +103,13 @@ class TennisBallTracker(Node):
         self.cy = msg.k[5]
 
         self.cam_info_received = True
-        self.get_logger().info(f"Camera intrinsics received: fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}")
+        self.get_logger().info(
+            f"Camera intrinsics received: fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}")
 
     def is_tennis_ball(self, contour, u, v, depth_img):
         """
-        Verify if detected blob is actually a tennis ball
-        Checks: shape, roundness, physical size, depth consistency
+        Verify if detected blob is actually a tennis ball.
+        Checks: shape, roundness, physical size, depth consistency.
         Returns: (is_valid, debug_info)
         """
         debug_info = {}
@@ -122,24 +124,13 @@ class TennisBallTracker(Node):
         circularity = 4 * np.pi * area / (perimeter * perimeter)
         debug_info['circularity'] = circularity
 
-        # Circularity should be close to 1.0 for a circle
-        if circularity < self.CIRCULARITY_THRESHOLD:
-            debug_info['fail_reason'] = f'low_circularity ({circularity:.2f} < {self.CIRCULARITY_THRESHOLD})'
-            self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
-            return False, debug_info
-
         # 2. Check if shape is approximately circular using ellipse fitting
-        if len(contour) >= 5:  # Need at least 5 points to fit an ellipse
+        aspect_ratio = 0
+        if len(contour) >= 5:
             ellipse = cv2.fitEllipse(contour)
             (x_e, y_e), (MA, ma), angle = ellipse
             aspect_ratio = min(MA, ma) / max(MA, ma) if max(MA, ma) > 0 else 0
             debug_info['aspect_ratio'] = aspect_ratio
-
-            # Aspect ratio should be close to 1.0 for a circle
-            if aspect_ratio < self.ASPECT_RATIO_THRESHOLD:
-                debug_info['fail_reason'] = f'not_circular (aspect={aspect_ratio:.2f} < {self.ASPECT_RATIO_THRESHOLD})'
-                self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
-                return False, debug_info
 
         # 3. Check physical size using depth
         try:
@@ -159,10 +150,8 @@ class TennisBallTracker(Node):
 
             z = float(np.median(valid))
 
-            # ---------------------------------------------
             # Adaptive thresholds based on distance
-            # ---------------------------------------------
-            if z < 0.25:  # close range
+            if z < 0.25:
                 circularity_threshold = 0.02
                 aspect_threshold = 0.10
                 min_diameter = 0.015
@@ -170,43 +159,50 @@ class TennisBallTracker(Node):
                 circularity_threshold = self.CIRCULARITY_THRESHOLD
                 aspect_threshold = self.ASPECT_RATIO_THRESHOLD
                 min_diameter = self.MIN_DIAMETER_M
-            # ---------------------------------------------
 
             if not np.isfinite(z) or z <= 0.0 or z > self.MAX_DETECTION_DISTANCE_M:
                 debug_info['fail_reason'] = f'invalid_depth (z={z:.2f}m, max={self.MAX_DETECTION_DISTANCE_M}m)'
-                self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
+                if self.debug_logs:
+                    self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
                 return False, debug_info
 
             # Estimate physical diameter from pixel area
-            # Tennis ball diameter is approximately 6.5-6.7 cm
             pixel_radius = np.sqrt(area / np.pi)
-            physical_diameter = 2 * pixel_radius * z / self.fx  # in meters
+            physical_diameter = 2 * pixel_radius * z / self.fx
             debug_info['estimated_diameter_cm'] = physical_diameter * 100
             debug_info['depth_m'] = z
 
-            # Check if size is reasonable for a tennis ball
-            if physical_diameter < self.MIN_DIAMETER_M or physical_diameter > self.MAX_DIAMETER_M:
-                debug_info[
-                    'fail_reason'] = f'wrong_size ({physical_diameter * 100:.1f}cm, range: {self.MIN_DIAMETER_M * 100:.1f}-{self.MAX_DIAMETER_M * 100:.1f}cm)'
-                self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
+            if circularity < circularity_threshold:
+                debug_info['fail_reason'] = f'low_circularity ({circularity:.2f} < {circularity_threshold})'
+                return False, debug_info
+
+            if aspect_ratio < aspect_threshold:
+                debug_info['fail_reason'] = f'not_circular (aspect={aspect_ratio:.2f} < {aspect_threshold})'
+                return False, debug_info
+
+            if physical_diameter < min_diameter or physical_diameter > self.MAX_DIAMETER_M:
+                debug_info['fail_reason'] = (
+                    f'wrong_size ({physical_diameter * 100:.1f}cm, '
+                    f'range: {min_diameter * 100:.1f}-{self.MAX_DIAMETER_M * 100:.1f}cm)'
+                )
                 return False, debug_info
 
             # 4. Check depth consistency across detected region
             x, y, w, h = cv2.boundingRect(contour)
             roi_depth = depth_img[max(0, y):min(depth_img.shape[0], y + h),
-            max(0, x):min(depth_img.shape[1], x + w)]
+                                  max(0, x):min(depth_img.shape[1], x + w)]
 
-            # Filter out zero/invalid depths
             valid_depths = roi_depth[roi_depth > 0]
             if len(valid_depths) > 0:
                 depth_std = np.std(valid_depths)
                 debug_info['depth_std'] = depth_std
 
-                # Depth should be fairly consistent across the ball
                 if depth_std > self.DEPTH_STD_THRESHOLD:
-                    debug_info[
-                        'fail_reason'] = f'inconsistent_depth (std={depth_std:.3f}m > {self.DEPTH_STD_THRESHOLD}m)'
-                    self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
+                    debug_info['fail_reason'] = (
+                        f'inconsistent_depth (std={depth_std:.3f}m > {self.DEPTH_STD_THRESHOLD}m)'
+                    )
+                    if self.debug_logs:
+                        self.get_logger().info(f"❌ REJECTED: {debug_info['fail_reason']}")
                     return False, debug_info
 
         except Exception as e:
@@ -215,19 +211,16 @@ class TennisBallTracker(Node):
             return False, debug_info
 
         debug_info['pass'] = True
-        self.get_logger().info(
-            f"✅ ACCEPTED: circularity={circularity:.2f}, aspect={debug_info.get('aspect_ratio', 0):.2f}, "
-            f"diameter={physical_diameter * 100:.1f}cm, depth={z:.2f}m, depth_std={debug_info.get('depth_std', 0):.3f}m")
+        if self.debug_logs:
+            self.get_logger().info(
+                f"✅ ACCEPTED: circularity={circularity:.2f}, aspect={debug_info.get('aspect_ratio', 0):.2f}, "
+                f"diameter={physical_diameter * 100:.1f}cm, depth={z:.2f}m, "
+                f"depth_std={debug_info.get('depth_std', 0):.3f}m")
         return True, debug_info
 
     def check_motion_pattern(self, current_pos):
-        """
-        Check motion pattern to verify it's a real object
-        Returns: (is_valid, debug_info)
-        """
+        """Check motion pattern to verify it's a real object"""
         debug_info = {}
-
-        # Add current position to history
         current_time = self.get_clock().now()
 
         if self.last_position is not None and self.last_timestamp is not None:
@@ -237,7 +230,6 @@ class TennisBallTracker(Node):
                 velocity = displacement / dt
                 debug_info['velocity'] = velocity
 
-                # Tennis ball shouldn't move too fast in typical scenarios
                 if velocity > self.MAX_VELOCITY_MPS:
                     debug_info['motion_warning'] = f'very_fast_movement ({velocity:.2f} m/s)'
 
@@ -248,9 +240,8 @@ class TennisBallTracker(Node):
         return True, debug_info
 
     def publish_visual_marker(self, x_cam, y_cam, z_cam, u, v, contour, cv_img, is_valid=True):
-        """
-        Publish visual marker for RViz and annotated image
-        """
+        """Publish visual marker for RViz and annotated image"""
+
         # 1. Publish 3D marker for RViz (only if valid)
         if is_valid:
             marker = Marker()
@@ -260,55 +251,38 @@ class TennisBallTracker(Node):
             marker.id = 0
             marker.type = Marker.SPHERE
             marker.action = Marker.ADD
-
-            # Position
             marker.pose.position.x = x_cam
             marker.pose.position.y = y_cam
             marker.pose.position.z = z_cam
             marker.pose.orientation.w = 1.0
-
-            # Scale (tennis ball diameter ~6.7cm)
             marker.scale.x = 0.067
             marker.scale.y = 0.067
             marker.scale.z = 0.067
-
-            # Color (yellow-green for tennis ball)
             marker.color = ColorRGBA(r=0.8, g=1.0, b=0.0, a=0.8)
-
-            marker.lifetime.sec = 1  # Marker lifetime
-
+            marker.lifetime.sec = 1
             self.marker_pub.publish(marker)
 
         # 2. Publish annotated image
         annotated_img = cv_img.copy()
 
-        # Choose colors based on validation status
         if is_valid:
-            contour_color = (0, 255, 0)  # Green for valid
-            bbox_color = (0, 255, 255)  # Yellow for valid
-            center_color = (0, 0, 255)  # Red
+            contour_color = (0, 255, 0)
+            bbox_color = (0, 255, 255)
+            center_color = (0, 0, 255)
             label = f'Tennis Ball ({z_cam:.1f}m)'
         else:
-            contour_color = (0, 0, 255)  # Red for rejected
-            bbox_color = (0, 165, 255)  # Orange for rejected
-            center_color = (255, 0, 0)  # Blue
+            contour_color = (0, 0, 255)
+            bbox_color = (0, 165, 255)
+            center_color = (255, 0, 0)
             label = f'REJECTED ({z_cam:.1f}m)'
 
-        # Draw contour
         cv2.drawContours(annotated_img, [contour], -1, contour_color, 2)
-
-        # Draw bounding box
         x, y, w, h = cv2.boundingRect(contour)
         cv2.rectangle(annotated_img, (x, y), (x + w, y + h), bbox_color, 2)
-
-        # Draw center point
         cv2.circle(annotated_img, (u, v), 5, center_color, -1)
-
-        # Add text label
         cv2.putText(annotated_img, label, (x, y - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, contour_color, 2)
 
-        # Publish to appropriate topic
         annotated_msg = self.bridge.cv2_to_imgmsg(annotated_img, encoding='bgr8')
         annotated_msg.header.stamp = self.get_clock().now().to_msg()
         annotated_msg.header.frame_id = 'zed_camera_center'
@@ -316,19 +290,16 @@ class TennisBallTracker(Node):
         if is_valid:
             self.annotated_img_pub.publish(annotated_msg)
 
-        # Always publish to debug topic (shows ALL detections)
+        # Always publish to debug topic (shows ALL detections including rejected)
         self.debug_img_pub.publish(annotated_msg)
 
     def rgb_cb(self, msg: Image):
         """Process RGB image to detect tennis ball"""
         if None in [self.fx, self.fy, self.cx, self.cy]:
-            # Wait until intrinsics are received
             return
 
-        # Convert ROS Image to OpenCV
         cv_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
 
-        # Detect green tennis ball (adjust HSV range as needed)
         hsv = cv2.cvtColor(cv_img, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, (29, 86, 6), (64, 255, 255))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -337,56 +308,47 @@ class TennisBallTracker(Node):
             c = max(contours, key=cv2.contourArea)
             area = cv2.contourArea(c)
             if area < 10:
-                return  # tiny blobs
+                return
 
             M = cv2.moments(c)
             if M['m00'] > 0:
                 u = int(M['m10'] / M['m00'])
                 v = int(M['m01'] / M['m00'])
 
-                is_valid = True  # Assume valid unless validation rejects
+                is_valid = True
                 debug_info = {}
 
-                # Verify it's actually a tennis ball before processing
                 if self.ENABLE_VALIDATION and self.depth_img is not None:
                     is_valid, debug_info = self.is_tennis_ball(c, u, v, self.depth_img)
 
-                # If validation disabled, always treat as valid
-                # If validation enabled, only proceed if passed validation
                 if not self.ENABLE_VALIDATION or is_valid:
                     self.ball_pos_px = (u, v, area)
 
-                    # Publish TF if depth is available
                     if self.depth_img is not None:
                         try:
-                            # ----- Robust depth estimation (5x5 median window) -----
                             h, w = self.depth_img.shape[:2]
 
-                            # Clamp ROI to image bounds
                             u_min = max(0, u - 2)
                             u_max = min(w, u + 3)
                             v_min = max(0, v - 2)
                             v_max = min(h, v + 3)
 
                             roi = self.depth_img[v_min:v_max, u_min:u_max]
-
                             valid = roi[np.isfinite(roi) & (roi > 0)]
 
                             if len(valid) == 0:
-                                return  # no valid depth nearby
+                                return
 
                             z = float(np.median(valid))
-                            # --------------------------------------------------------
+
                         except Exception as e:
                             self.get_logger().warn(f"Depth read failed: {e}")
                             return
 
-                        # Convert pixel to camera coordinates
                         x_cam = (u - self.cx) * z / self.fx
                         y_cam = (v - self.cy) * z / self.fy
                         z_cam = z
 
-                        # Check motion pattern
                         motion_valid, motion_info = self.check_motion_pattern((x_cam, y_cam, z_cam))
                         if 'motion_warning' in motion_info:
                             self.get_logger().warn(f"Motion: {motion_info['motion_warning']}")
@@ -396,7 +358,6 @@ class TennisBallTracker(Node):
                             self.odom_origin = (x_cam, y_cam, z_cam)
                             self.odom_set = True
 
-                            # Publish static TF from "odom" -> "zed_camera_center" at first position
                             t_static = TransformStamped()
                             t_static.header.stamp = self.get_clock().now().to_msg()
                             t_static.header.frame_id = 'odom'
@@ -410,15 +371,13 @@ class TennisBallTracker(Node):
                             t_static.transform.rotation.w = 1.0
                             self.static_tf_broadcaster.sendTransform(t_static)
 
-                        # Ball position relative to odom
                         x_rel = x_cam - self.odom_origin[0]
                         y_rel = y_cam - self.odom_origin[1]
                         z_rel = z_cam - self.odom_origin[2]
 
-                        # Publish TF for the tennis ball
                         t = TransformStamped()
                         t.header.stamp = self.get_clock().now().to_msg()
-                        t.header.frame_id = 'zed_camera_center'  # relative to camera
+                        t.header.frame_id = 'zed_camera_center'
                         t.child_frame_id = 'tennis_ball'
                         t.transform.translation.x = x_rel
                         t.transform.translation.y = y_rel
@@ -436,11 +395,10 @@ class TennisBallTracker(Node):
                         point_msg.z = z_cam
                         self.ball_pub.publish(point_msg)
 
-                        # Publish visual markers
                         self.publish_visual_marker(x_cam, y_cam, z_cam, u, v, c, cv_img, is_valid=True)
 
                 else:
-                    # Validation failed - still publish debug image to show what was rejected
+                    # Validation failed - publish debug image to show what was rejected
                     if self.depth_img is not None:
                         try:
                             z = float(self.depth_img[v, u])
@@ -449,7 +407,7 @@ class TennisBallTracker(Node):
                                 y_cam = (v - self.cy) * z / self.fy
                                 z_cam = z
                                 self.publish_visual_marker(x_cam, y_cam, z_cam, u, v, c, cv_img, is_valid=False)
-                        except:
+                        except Exception:
                             pass
 
     def depth_cb(self, msg: Image):
@@ -464,7 +422,7 @@ class TennisBallTracker(Node):
                 z = float(self.depth_img[v, u])
                 if z > 0.0:
                     print(f"Tennis ball area: {area:.1f} px, approx. distance: {z:.2f} m")
-            except:
+            except Exception:
                 pass
 
 

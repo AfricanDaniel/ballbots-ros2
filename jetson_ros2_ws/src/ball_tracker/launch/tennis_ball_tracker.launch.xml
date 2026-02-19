@@ -9,12 +9,27 @@
     description="Launch RViz visualization"
   />
 
+  <arg
+    name="debug_logs"
+    default="false"
+    description="Enable verbose detection logs"
+  />
+
+  <!-- ============================= -->
+  <!-- RealSense Camera Launch -->
+  <!-- ============================= -->
+  <include
+    file="$(find-pkg-share realsense2_camera)/launch/rs_launch.py">
+    <arg name="align_depth.enable" value="true"/>
+  </include>
+
   <!-- ============================= -->
   <!-- ZED Camera Launch -->
   <!-- ============================= -->
   <include
     file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
     <arg name="camera_model" value="zed2i"/>
+    <arg name="camera_name" value="zed"/>
   </include>
 
   <!-- ============================= -->
@@ -25,7 +40,18 @@
     exec="tennis_ball_tracker"
     name="tennis_ball_tracker"
     output="screen"
-  />
+  >
+    <param name="debug_logs" value="$(var debug_logs)"/>
+  </node>
+
+  <node
+    pkg="ball_tracker"
+    exec="realsense_tracker"
+    name="realsense_tracker"
+    output="screen"
+  >
+    <param name="debug_logs" value="$(var debug_logs)"/>
+  </node>
 
   <!-- ============================= -->
   <!-- RViz (optional) -->

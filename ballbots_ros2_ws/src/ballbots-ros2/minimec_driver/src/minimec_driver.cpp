@@ -1,34 +1,11 @@
 /// @file
-/// @brief Forward kinematics implementation for a mecanum wheel robot.
-///
-/// PARAMETERS:
-///     rate (double): loop frequency [hertz]
-///     fl_joint_name (string): front-left joint name as defined in the robot description
-///     fr_joint_name (string): front-right joint name as defined in the robot description
-///     rr_joint_name (string): rear-right joint name as defined in the robot description 
-///     rl_joint_name (string): rear-left joint name as defined in the robot description 
-///     fl_feedback_topic (string): front-left feedback topic (published by odrive)
-///     fr_feedback_topic (string): front-right feedback topic (published by odrive)
-///     rr_feedback_topic (string): rear-right feedback topic (published by odrive) 
-///     rl_feedback_topic (string): rear-left feedback topic (published by odrive)
-///     fl_control_topic (string): front-left control topic (subscribed by odrive) 
-///     fr_control_topic (string): front-right control topic (subscribed by odrive) 
-///     rr_control_topic (string): rear-right control topic (subscribed by odrive) 
-///     rl_control_topic (string): rear-left control topic (subscribed by odrive) 
-///     fl_control_service (string): front-left service name (offered by odrive)
-///     fr_control_service (string): front-right service name (offered by odrive)
-///     rr_control_service (string): rear-right service name (offered by odrive)
-///     rl_control_service (string): rear-left service name (offered by odrive) 
-
-/// PUBLISHES:
-///     ~/wheel_cmd (minimec_msgs::msg::WheelCommands): output wheel commands [rad/s]
-/// SUBSCRIBES:
-///     ~/cmd_vel (geometry_msgs::msg::Twist): input desired twist
+/// @brief Forward kinematics implementation for a mecanum wheel robot with robust ODrive startup.
 
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "minimec_msgs/msg/wheel_commands.hpp"
@@ -46,7 +23,9 @@ public:
   MinimecDriver()
   : Node("minimec_driver")
   {
-    // parameters declaration
+    // ==========================================
+    // 1. PARAMETER DECLARATION
+    // ==========================================
     declare_parameter("rate", 50.0);
     declare_parameter("fl_joint_name", rclcpp::ParameterType::PARAMETER_STRING);
     declare_parameter("fr_joint_name", rclcpp::ParameterType::PARAMETER_STRING);
@@ -65,17 +44,19 @@ public:
     declare_parameter("rr_control_service", rclcpp::ParameterType::PARAMETER_STRING);
     declare_parameter("rl_control_service", rclcpp::ParameterType::PARAMETER_STRING);
 
-    // store parameters we will need
+    // Load Parameters
     fl_joint_name = get_parameter("fl_joint_name").as_string();
     fr_joint_name = get_parameter("fr_joint_name").as_string();
     rr_joint_name = get_parameter("rr_joint_name").as_string();
     rl_joint_name = get_parameter("rl_joint_name").as_string();
 
-    // calculate timer step
+    // Calculate Loop Rate
     std::chrono::milliseconds timer_step =
       (std::chrono::milliseconds)(int)(1000.0 / get_parameter("rate").as_double());
 
-    // create publishers and subscribers
+    // ==========================================
+    // 2. SETUP PUBS / SUBS
+    // ==========================================
     sub_wheel_cmd_ = create_subscription<minimec_msgs::msg::WheelCommands>(
       "wheel_cmd", 10, std::bind(&MinimecDriver::wheelCmdCallback, this, std::placeholders::_1));
 
@@ -97,98 +78,89 @@ public:
       get_parameter("rl_feedback_topic").as_string(), 10,
       std::bind(&MinimecDriver::controllerCallbackRL, this, std::placeholders::_1));
 
-    // create service clients
+    pub_joint_states_ = create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
+
+    // ==========================================
+    // 3. SETUP SERVICE CLIENTS
+    // ==========================================
     client_fl_ = create_client<odrive_can::srv::AxisState>(get_parameter("fl_control_service").as_string());
     client_fr_ = create_client<odrive_can::srv::AxisState>(get_parameter("fr_control_service").as_string());
     client_rr_ = create_client<odrive_can::srv::AxisState>(get_parameter("rr_control_service").as_string());
     client_rl_ = create_client<odrive_can::srv::AxisState>(get_parameter("rl_control_service").as_string());
 
-    // wait for services to become available
-    while (!client_fl_->wait_for_service(1s)) {
-      if (!rclcpp::ok()) {
-        RCLCPP_ERROR(
-          rclcpp::get_logger(
-            "rclcpp"), "Interrupted while waiting for the service. Exiting.");
-      }
-      RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "service not available, waiting again...");
-    }
+    // Wait for services to be available (Blocking check at startup)
+    waitForServices();
 
-    while (!client_fr_->wait_for_service(1s)) {
-      if (!rclcpp::ok()) {
-        RCLCPP_ERROR(
-          rclcpp::get_logger(
-            "rclcpp"), "Interrupted while waiting for the service. Exiting.");
-      }
-      RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "service not available, waiting again...");
-    }
-
-    while (!client_rr_->wait_for_service(1s)) {
-      if (!rclcpp::ok()) {
-        RCLCPP_ERROR(
-          rclcpp::get_logger(
-            "rclcpp"), "Interrupted while waiting for the service. Exiting.");
-      }
-      RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "service not available, waiting again...");
-    }
-
-    while (!client_rl_->wait_for_service(1s)) {
-      if (!rclcpp::ok()) {
-        RCLCPP_ERROR(
-          rclcpp::get_logger(
-            "rclcpp"), "Interrupted while waiting for the service. Exiting.");
-      }
-      RCLCPP_INFO(rclcpp::get_logger("rclcpp"), "service not available, waiting again...");
-    }
-
-    // create main loop timer
+    // ==========================================
+    // 4. START TIMER
+    // ==========================================
     timer_ = create_wall_timer(
       timer_step, std::bind(&MinimecDriver::timerCallback, this));
 
-    // create joint state publisher
-    pub_joint_states_ = create_publisher<sensor_msgs::msg::JointState>("joint_states", 10);
-
+    RCLCPP_INFO(this->get_logger(), "Driver Initialized. Waiting for ODrives...");
   }
 
 private:
+  void waitForServices() {
+      // Helper to wait for all 4 clients
+      auto wait_for = [this](auto client) {
+          while (!client->wait_for_service(1s)) {
+              if (!rclcpp::ok()) {
+                  RCLCPP_ERROR(this->get_logger(), "Interrupted while waiting for service.");
+                  return;
+              }
+              RCLCPP_INFO(this->get_logger(), "Waiting for ODrive services...");
+          }
+      };
+      wait_for(client_fl_);
+      wait_for(client_fr_);
+      wait_for(client_rr_);
+      wait_for(client_rl_);
+  }
+
   void timerCallback()
   {
-    if (first_run) {
-      enableOdrives();
-      first_run = false;
-    } else if (odrives_enabled < 4) {
-      RCLCPP_INFO(this->get_logger(), "odrives enabled %d", odrives_enabled);
-    } else {
+    // ==========================================
+    // MODE A: RETRY LOGIC (Startup)
+    // ==========================================
+    if (odrives_enabled < 4) {
+      // Run retry logic every 100 ticks (approx 2.0 seconds at 50Hz)
+      if (retry_counter % 100 == 0) {
+          RCLCPP_INFO(this->get_logger(), "Attempting to Enable ODrives (Current: %d/4)...", odrives_enabled);
+          enableOdrives();
+      }
+      retry_counter++;
+      return; // Skip normal control until motors are ready
+    }
+
+    // ==========================================
+    // MODE B: NORMAL CONTROL (Running)
+    // ==========================================
+    else {
       auto msg = odrive_can::msg::ControlMessage{};
-      msg.control_mode = 2;
-      msg.input_mode = 1;
+      msg.control_mode = 2; // VELOCITY_CONTROL
+      msg.input_mode = 1;   // PASSTHROUGH
       msg.input_pos = 0.0;
       msg.input_torque = 0.0;
 
-      // front left
+      // 1. Send Commands
       msg.input_vel = -wheel_speeds.fl;
       pub_fl_->publish(msg);
 
-      // front right
       msg.input_vel = wheel_speeds.fr;
       pub_fr_->publish(msg);
 
-      // rear right
       msg.input_vel = wheel_speeds.rr;
       pub_rr_->publish(msg);
 
-      // rear left
       msg.input_vel = -wheel_speeds.rl;
       pub_rl_->publish(msg);
 
-      // publish joint states
+      // 2. Publish Joint States
       sensor_msgs::msg::JointState joint_msg;
-
       joint_msg.header.stamp = get_clock()->now();
-      joint_msg.name = std::vector<std::string>({fl_joint_name,
-            fr_joint_name, rr_joint_name,
-            rl_joint_name});
-
-      joint_msg.position = std::vector<double>({-wheel_pos.fl, -wheel_pos.fr, -wheel_pos.rr, -wheel_pos.rl});
+      joint_msg.name = {fl_joint_name, fr_joint_name, rr_joint_name, rl_joint_name};
+      joint_msg.position = {-wheel_pos.fl, -wheel_pos.fr, -wheel_pos.rr, -wheel_pos.rl};
 
       pub_joint_states_->publish(joint_msg);
     }
@@ -197,26 +169,32 @@ private:
   void enableOdrives()
   {
     auto request = std::make_shared<odrive_can::srv::AxisState::Request>();
-    request->axis_requested_state = 8;
+    request->axis_requested_state = 8; // AXIS_STATE_CLOSED_LOOP_CONTROL
 
+    // Robust Callback: Only increments if we aren't full yet
     auto callback = [this](rclcpp::Client<odrive_can::srv::AxisState>::SharedFuture future) {
-        auto result = future.get();
-        RCLCPP_INFO(this->get_logger(), "Received response from odrive");
-        odrives_enabled += 1;
-      };
+        try {
+            future.get(); // Ensure no exceptions
+            if (this->odrives_enabled < 4) {
+                this->odrives_enabled++;
+                RCLCPP_INFO(this->get_logger(), "ODrive confirmed Closed-Loop (%d/4)", this->odrives_enabled);
+            }
+        } catch (...) {
+            RCLCPP_WARN(this->get_logger(), "Failed to receive service response.");
+        }
+    };
 
+    // Send requests
     client_fl_->async_send_request(request, callback);
-
     client_fr_->async_send_request(request, callback);
-
     client_rr_->async_send_request(request, callback);
-
     client_rl_->async_send_request(request, callback);
   }
 
   void wheelCmdCallback(const minimec_msgs::msg::WheelCommands & msg)
   {
-    // translate the wheel speeds to turns/s
+    // translate wheel speeds to turns/s
+    // 2.0 comes from gear ratio? 3.1415... is PI
     wheel_speeds = minimeclib::WheelSpeeds{
       msg.fl / 2.0 / 3.14159265358979323846,
       msg.fr / 2.0 / 3.14159265358979323846,
@@ -225,63 +203,58 @@ private:
     };
   }
 
-  void controllerCallbackFL(const odrive_can::msg::ControllerStatus & msg)
-  {
+  void controllerCallbackFL(const odrive_can::msg::ControllerStatus & msg) {
     wheel_pos.fl = msg.pos_estimate * 2.0 * 3.14159265358979323846;
   }
-
-  void controllerCallbackFR(const odrive_can::msg::ControllerStatus & msg)
-  {
+  void controllerCallbackFR(const odrive_can::msg::ControllerStatus & msg) {
     wheel_pos.fr = msg.pos_estimate * 2.0 * 3.14159265358979323846;
   }
-
-  void controllerCallbackRR(const odrive_can::msg::ControllerStatus & msg)
-  {
+  void controllerCallbackRR(const odrive_can::msg::ControllerStatus & msg) {
     wheel_pos.rr = msg.pos_estimate * 2.0 * 3.14159265358979323846;
   }
-
-  void controllerCallbackRL(const odrive_can::msg::ControllerStatus & msg)
-  {
+  void controllerCallbackRL(const odrive_can::msg::ControllerStatus & msg) {
     wheel_pos.rl = msg.pos_estimate * 2.0 * 3.14159265358979323846;
   }
 
-  // track if its the first run to enable odrives
-  bool first_run = true;
+  // --- MEMBER VARIABLES ---
 
-  // number of odrives that are enabled
+  // State Tracking
+  int retry_counter = 0;
   int odrives_enabled{0};
 
-  // track wheel positions and speeds
+  // Robot State
   minimeclib::WheelPositions wheel_pos;
   minimeclib::WheelSpeeds wheel_speeds;
 
-  // publishers and subscribers
+  // ROS Interfaces
   rclcpp::Subscription<minimec_msgs::msg::WheelCommands>::SharedPtr sub_wheel_cmd_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joint_states_;
+
+  // ODrive Control Publishers
   rclcpp::Publisher<odrive_can::msg::ControlMessage>::SharedPtr pub_fl_;
   rclcpp::Publisher<odrive_can::msg::ControlMessage>::SharedPtr pub_fr_;
   rclcpp::Publisher<odrive_can::msg::ControlMessage>::SharedPtr pub_rr_;
   rclcpp::Publisher<odrive_can::msg::ControlMessage>::SharedPtr pub_rl_;
+
+  // ODrive Feedback Subscribers
   rclcpp::Subscription<odrive_can::msg::ControllerStatus>::SharedPtr sub_fl_;
   rclcpp::Subscription<odrive_can::msg::ControllerStatus>::SharedPtr sub_fr_;
   rclcpp::Subscription<odrive_can::msg::ControllerStatus>::SharedPtr sub_rr_;
   rclcpp::Subscription<odrive_can::msg::ControllerStatus>::SharedPtr sub_rl_;
 
-  // service clients
+  // ODrive Service Clients
   rclcpp::Client<odrive_can::srv::AxisState>::SharedPtr client_fl_;
   rclcpp::Client<odrive_can::srv::AxisState>::SharedPtr client_fr_;
   rclcpp::Client<odrive_can::srv::AxisState>::SharedPtr client_rr_;
   rclcpp::Client<odrive_can::srv::AxisState>::SharedPtr client_rl_;
 
-  // timer
   rclcpp::TimerBase::SharedPtr timer_;
 
-  // store joint names
+  // Names
   std::string fl_joint_name;
   std::string fr_joint_name;
   std::string rr_joint_name;
   std::string rl_joint_name;
-
 };
 
 int main(int argc, char * argv[])

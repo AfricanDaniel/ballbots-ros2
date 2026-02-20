@@ -75,10 +75,10 @@ class RealSenseTracker(Node):
         match_count  = cv2.countNonZero(mask)
         hsv_pct      = (match_count / total_pixels) * 100.0
 
-        self.get_logger().info(
-            f"[DATA] HSV={match_count}px ({hsv_pct:.1f}% of frame={w_img}x{h_img})",
-            throttle_duration_sec=0.5
-        )
+        # self.get_logger().info(
+        #     f"[DATA] HSV={match_count}px ({hsv_pct:.1f}% of frame={w_img}x{h_img})",
+        #     throttle_duration_sec=0.5
+        # )
         # =====================================================
 
         # =====================================================
@@ -99,11 +99,11 @@ class RealSenseTracker(Node):
         valid_d_vals = center_depth[(center_depth > 0) & ~np.isnan(center_depth)]
         median_depth = float(np.median(valid_d_vals)) if len(valid_d_vals) > 0 else float('nan')
 
-        self.get_logger().info(
-            f"[DATA] CenterDepth: nan={nan_pct:.1f}% valid={100.0 - nan_pct:.1f}% "
-            f"median={median_depth:.1f}mm",
-            throttle_duration_sec=0.5
-        )
+        # self.get_logger().info(
+        #     f"[DATA] CenterDepth: nan={nan_pct:.1f}% valid={100.0 - nan_pct:.1f}% "
+        #     f"median={median_depth:.1f}mm",
+        #     throttle_duration_sec=0.5
+        # )
         # =====================================================
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -124,18 +124,18 @@ class RealSenseTracker(Node):
         center_u    = x_b + w_b // 2
         center_v    = y_b + h_b // 2
 
-        self.get_logger().info(
-            f"[DATA] Contour: area={area:.0f}px bbox={w_b}x{h_b} "
-            f"circ={circularity:.2f} center=({center_u},{center_v})",
-            throttle_duration_sec=0.5
-        )
+        # self.get_logger().info(
+        #     f"[DATA] Contour: area={area:.0f}px bbox={w_b}x{h_b} "
+        #     f"circ={circularity:.2f} center=({center_u},{center_v})",
+        #     throttle_duration_sec=0.5
+        # )
         # =====================================================
 
         if area < self.MIN_AREA:
-            self.get_logger().info(
-                f"[DATA] area={area:.0f} < MIN_AREA={self.MIN_AREA} — skipping",
-                throttle_duration_sec=1.0
-            )
+            # self.get_logger().info(
+            #     f"[DATA] area={area:.0f} < MIN_AREA={self.MIN_AREA} — skipping",
+            #     throttle_duration_sec=1.0
+            # )
             return
 
         M = cv2.moments(c)
@@ -157,10 +157,10 @@ class RealSenseTracker(Node):
         roi[roi == 0] = np.nan
         z_mm = float(np.nanmedian(roi))
 
-        self.get_logger().info(
-            f"[DATA] Depth at centroid ({u},{v}): {z_mm:.1f}mm",
-            throttle_duration_sec=0.5
-        )
+        # self.get_logger().info(
+        #     f"[DATA] Depth at centroid ({u},{v}): {z_mm:.1f}mm",
+        #     throttle_duration_sec=0.5
+        # )
         # =====================================================
 
         if np.isnan(z_mm) or z_mm <= 0:
@@ -171,21 +171,21 @@ class RealSenseTracker(Node):
                 x_cam = (u - self.cx) * 0.15 / self.fx
                 if abs(x_cam) < 0.06:
                     z = 0.15
-                    self.get_logger().info(
-                        f"[DATA] Blind spot + centered (x={x_cam:.3f}m area={area:.0f}) → z=0.15m"
-                    )
+                    # self.get_logger().info(
+                    #     f"[DATA] Blind spot + centered (x={x_cam:.3f}m area={area:.0f}) → z=0.15m"
+                    # )
                 else:
                     z = 0.15
-                    self.get_logger().info(
-                        f"[DATA] Blind spot but off-center x={x_cam:.3f}m — still publishing"
-                    )
+                    # self.get_logger().info(
+                    #     f"[DATA] Blind spot but off-center x={x_cam:.3f}m — still publishing"
+                    # )
             # =====================================================
             else:
-                self.get_logger().warn(
-                    f"[DATA] Depth invalid, area={area:.0f} < GRAB_AREA={self.GRAB_AREA} "
-                    f"— skipping (no fallback)",
-                    throttle_duration_sec=1.0
-                )
+                # self.get_logger().warn(
+                #     f"[DATA] Depth invalid, area={area:.0f} < GRAB_AREA={self.GRAB_AREA} "
+                #     f"— skipping (no fallback)",
+                #     throttle_duration_sec=1.0
+                # )
                 self._publish_debug_img(cv_img, c, u, v, 0.0, area,
                                         nan_pct, hsv_pct, circularity, w_b, h_b,
                                         valid=False)
@@ -196,9 +196,9 @@ class RealSenseTracker(Node):
         x_cam = (u - self.cx) * z / self.fx
         y_cam = (v - self.cy) * z / self.fy
 
-        self.get_logger().info(
-            f"[DATA] Publishing: x={x_cam:.3f}m y={y_cam:.3f}m z={z:.3f}m"
-        )
+        # self.get_logger().info(
+        #     f"[DATA] Publishing: x={x_cam:.3f}m y={y_cam:.3f}m z={z:.3f}m"
+        # )
 
         self._publish_debug_img(cv_img, c, u, v, z, area,
                                 nan_pct, hsv_pct, circularity, w_b, h_b,

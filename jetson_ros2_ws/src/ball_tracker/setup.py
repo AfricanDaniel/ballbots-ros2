@@ -27,6 +27,7 @@ setup(
             'number_publisher = ball_tracker.number_publisher:main',
             'tennis_ball_tracker = ball_tracker.tennis_ball_tracker:main',
             'realsense_tracker = ball_tracker.realsense_tracker:main',
+            'bottle_tracker = ball_tracker.bottle_tracker:main',
         ],
     },
 )

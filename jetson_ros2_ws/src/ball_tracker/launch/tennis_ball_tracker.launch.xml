@@ -53,6 +53,14 @@
     <param name="debug_logs" value="$(var debug_logs)"/>
   </node>
 
+    <node
+    pkg="ball_tracker"
+    exec="bottle_tracker"
+    name="bottle_tracker"
+    output="screen">
+  </node>
+
+
   <!-- ============================= -->
   <!-- RViz (optional) -->
   <!-- ============================= -->

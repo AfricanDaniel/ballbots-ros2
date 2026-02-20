@@ -25,6 +25,7 @@ class BallChaser(Node):
                 ('claw_closed_deg', 173.0),
                 ('target_dist', 0.2),
                 ('tilt_start_dist', 0.8),
+                ('grab_dist', 0.16),
             ]
         )
 
@@ -37,6 +38,7 @@ class BallChaser(Node):
         self.CLAW_CLOSED     = self.get_parameter('claw_closed_deg').value
         self.target_dist     = self.get_parameter('target_dist').value
         self.tilt_start_dist = self.get_parameter('tilt_start_dist').value
+        self.grab_dist = self.get_parameter('grab_dist').value
 
         self.get_logger().info(
             f"Params loaded | ARM_HORIZONTAL={self.ARM_HORIZONTAL} | ARM_MAX_TILT={self.ARM_MAX_TILT} | "
@@ -266,26 +268,17 @@ class BallChaser(Node):
         if self.use_close_cam:
             return
 
-        # Hand off to RealSense when close — creep forward then grab
+        # Hand off to RealSense when close
         if msg.z < self.tilt_start_dist:
             self.get_logger().info(
-                f"ZED z={msg.z:.2f}m < tilt_start_dist={self.tilt_start_dist:.2f}m "
-                f"— switching to RealSense, creeping forward"
+                f"ZED z={msg.z:.2f}m < {self.tilt_start_dist:.2f}m — Handoff to RealSense!"
             )
             self.use_close_cam = True
 
-            # Open claw before creeping
+            # Open claw, stop the robot, and reset alignment for the RealSense
             self.publish_claw(self.CLAW_OPEN)
-
-            # Creep in same direction as last ZED command
-            cmd = Twist()
-            cmd.linear.x = self._last_zed_vx * 0.3
-            cmd.linear.y = self._last_zed_vy * 0.3
-            self.get_logger().info(
-                f"Creeping at vx={cmd.linear.x:.2f} vy={cmd.linear.y:.2f} for ??s"
-            )
-            self.pub_cmd.publish(cmd)
-            self._creep_timer = self.create_timer(7.0, self._creep_done_cb)
+            self.stop_robot()
+            self.is_aligned = False
             return
 
         # Far range — arm horizontal, approach ball
@@ -336,79 +329,83 @@ class BallChaser(Node):
 
     # =====================================================
     # REALSENSE CALLBACK (close range: < tilt_start_dist)
-    # Kept for logging/future use — motion is now timed creep
+    # Active HSV Tracking + State Machine
+    # =====================================================
+    # =====================================================
+    # REALSENSE CALLBACK (close range: < tilt_start_dist)
+    # Active HSV Tracking + State Machine
     # =====================================================
     def close_range_callback(self, msg):
-        self.get_logger().info("Entered real sense territory")
-        return
-        if not self.is_active:
+        if not self.is_active or not self.use_close_cam or self.ball_grabbed:
             return
 
-        if not self.use_close_cam:
-            return
-
-        if self.ball_grabbed:
-            return
-
-        # Update watchdog time only on valid readings
         if math.isnan(msg.z) or msg.z <= 0.0:
             return
 
         if msg.z > self.tilt_start_dist:
-            self.get_logger().warn(
-                f"RealSense z={msg.z:.2f}m > tilt_start_dist — ignoring bad reading",
-                throttle_duration_sec=1.0
-            )
             return
 
         # Valid reading — update time
         self.last_realsense_time = self.get_clock().now()
 
         # =====================================================
-        # BLIND SPOT GRAB — add this RIGHT HERE, before anything else
-        # Ball is in RealSense blind spot (<15cm) and centered
-        # Trigger grab immediately instead of waiting for real_dist
+        # BLIND SPOT GRAB (Now uses YAML grab_dist!)
         # =====================================================
-        if msg.z == 0.15 and abs(msg.x) < 0.06:
+        if msg.z <= self.grab_dist and abs(msg.x) < 0.06:
             self.grab_confirm_count += 1
             self.get_logger().info(
-                f"Blind spot grab confirm {self.grab_confirm_count}/{self.GRAB_CONFIRM_NEEDED} "
+                f"Grab confirm {self.grab_confirm_count}/{self.GRAB_CONFIRM_NEEDED} "
                 f"(x={msg.x:.3f}m)"
             )
             if self.grab_confirm_count >= self.GRAB_CONFIRM_NEEDED:
                 self._cancel_creep_timer()
                 self.execute_grab()
+            else:
+                self.stop_robot()  # Hold still while confirming
             return
+
         # =====================================================
+        # ARM TILT LOGIC REMOVED
+        # =====================================================
+        # Lock the arm horizontally so it stays out of the way during approach!
+        self.publish_arm_angle(self.ARM_HORIZONTAL)
 
-        # Real Distance Compensation
-        pitch_deg = self.ARM_HORIZONTAL - self.arm_angle
-        pitch_rad = math.radians(pitch_deg)
-        real_dist = msg.z * math.cos(pitch_rad)
+        # =====================================================
+        # HSV STATE MACHINE: CLOSE RANGE PRECISION
+        # =====================================================
+        target_vx = 0.0
+        target_wz = 0.0
 
-        self.get_logger().info(
-            f"RealSense: z={msg.z:.2f}m real_dist={real_dist:.2f}m x={msg.x:.2f}m",
-            throttle_duration_sec=0.5
-        )
+        # Drive towards 0.0m to guarantee we aggressively cross the grab_dist tripwire
+        err_dist = msg.z - 0.0
 
-        # Tilt arm progressively
-        ratio = (real_dist - self.target_dist) / (self.tilt_start_dist - self.target_dist)
-        ratio = max(0.0, min(1.0, ratio))
-        target_angle = self.ARM_MAX_TILT + (ratio * (self.ARM_HORIZONTAL - self.ARM_MAX_TILT))
+        # STATE 1: ALIGNING PHASE
+        if not self.is_aligned:
+            target_vx = 0.0  # Hit the brakes!
 
-        if real_dist < 0.30:
-            self.publish_arm_angle(target_angle)
+            # Slower turning for close-range precision
+            target_wz = max(-0.25, min(0.25, -0.8 * msg.x))
+
+            # Very tight 3cm window since we are close
+            if abs(msg.x) < 0.03:
+                self.get_logger().info("RealSense Aligned! Final approach...")
+                self.is_aligned = True
+
+        # STATE 2: DRIVING PHASE
         else:
-            new_angle = self.arm_angle + 0.2 * (target_angle - self.arm_angle)
-            self.publish_arm_angle(new_angle)
+            # Slower approach speed (max 0.15 m/s)
+            target_vx = max(-0.15, min(0.15, 0.4 * err_dist))
+            # Micro-corrections to keep it dead center during approach
+            target_wz = max(-0.1, min(0.1, -0.5 * msg.x))
 
-        # Motion disabled — timed creep handles movement
-        # cmd = Twist()
-        # err_dist = real_dist - self.target_dist
-        # if abs(err_dist) > 0.05:
-        #     cmd.linear.x = max(-0.3, min(0.3, 0.5 * err_dist))
-        #     cmd.linear.y = max(-0.3, min(0.3, -1.0 * msg.x))
-        # self.pub_cmd.publish(cmd)
+        # APPLY SMOOTHER (Prevents mecanum wheel slip)
+        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
+
+        cmd = Twist()
+        cmd.linear.x = self.current_vx
+        cmd.linear.y = 0.0  # Strictly zero to prevent crab-walking
+        cmd.angular.z = target_wz
+        self.pub_cmd.publish(cmd)
 
 
 # =====================================================

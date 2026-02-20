@@ -23,7 +23,7 @@ class RealSenseTracker(Node):
         self.HSV_LOWER = (25, 40, 40)  # was (35, 80, 80) — much more permissive
         self.HSV_UPPER = (80, 255, 255)  # was (65, 255, 255) — wider hue range
         self.MIN_AREA  = 50    # ignore blobs smaller than this
-        self.GRAB_AREA = 6000   # area fallback threshold when depth is invalid
+        self.GRAB_AREA = 175000   # area fallback threshold when depth is invalid 135000
         self.DEPTH_ROI = 3      # pixel radius for depth sampling at ball centroid
         # =====================================================
 

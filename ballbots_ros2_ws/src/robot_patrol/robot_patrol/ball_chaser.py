@@ -21,7 +21,7 @@ class BallChaser(Node):
             parameters=[
                 ('arm_raised_deg', 252.0),
                 ('arm_lowered_deg', 177.0),
-                ('claw_open_deg', 170.0),
+                ('claw_open_deg', 152.0),
                 ('claw_closed_deg', 173.0),
                 ('target_dist', 0.2),
                 ('tilt_start_dist', 0.8),
@@ -81,6 +81,10 @@ class BallChaser(Node):
         self._last_zed_vx = 0.0
         self._last_zed_vy = 0.0
 
+        self.is_aligned = False
+        self.current_vx = 0.0
+        self.MAX_ACCEL = 0.02
+
         # Watchdog disabled — using timed creep instead
         self.create_timer(1.0, self.realsense_watchdog_cb)
 
@@ -104,6 +108,7 @@ class BallChaser(Node):
             self.last_realsense_time = None
             self.grab_confirm_count  = 0
             self._cancel_creep_timer()
+            self.is_aligned = False
             msg = "Chasing Started!"
         else:
             self.publish_arm_angle(self.ARM_HORIZONTAL)
@@ -168,12 +173,15 @@ class BallChaser(Node):
     # Step 3: Close claw (after 1s delay)
     # Step 4: Raise arm back to horizontal
     # =====================================================
+    # =====================================================
+    # GRAB SEQUENCE (Smooth Interpolation)
+    # =====================================================
     def execute_grab(self):
         if self.ball_grabbed:
             return
 
         self.get_logger().info("🎾 ========================================")
-        self.get_logger().info("🎾 BALL GRABBED — executing grab sequence  ")
+        self.get_logger().info("🎾 BALL GRABBED — executing smooth grab sequence")
         self.get_logger().info("🎾 ========================================")
 
         self.stop_robot()
@@ -181,28 +189,54 @@ class BallChaser(Node):
         self.grab_started = True
 
         # Step 1: Open claw
-        self.get_logger().info(f"Grab step 1: Opening claw to {self.CLAW_OPEN}°")
         self.publish_claw(self.CLAW_OPEN)
 
-        # Step 2: Lower arm
-        self.get_logger().info(f"Grab step 2: Lowering arm to {self.ARM_MAX_TILT}°")
-        self.publish_arm_angle(self.ARM_MAX_TILT)
+        # Step 2: Start smoothly lowering the arm
+        self._target_arm_angle = self.ARM_MAX_TILT
+        self._arm_step_dir = -1.0  # Direction multiplier (moving down)
+        self._arm_sweep_timer = self.create_timer(0.02, self._sweep_arm_cb)  # 50Hz update rate
 
-        # Step 3: Close claw after 1s
-        self._grab_timer = self.create_timer(1.0, self._close_claw_cb)
+    def _sweep_arm_cb(self):
+        """Slowly moves the arm 1 degree per tick until it hits the target"""
+        step_size = 1.0  # Move 1 degree every 0.02s
+        self.arm_angle += (step_size * self._arm_step_dir)
+
+        # Check if we have reached or passed the target angle
+        if (self._arm_step_dir < 0 and self.arm_angle <= self._target_arm_angle) or \
+                (self._arm_step_dir > 0 and self.arm_angle >= self._target_arm_angle):
+
+            self.arm_angle = self._target_arm_angle
+            self.publish_arm_angle(self.arm_angle)
+            self._arm_sweep_timer.cancel()
+
+            # State routing: Did we just finish going down, or up?
+            if self.arm_angle == self.ARM_MAX_TILT:
+                # Reached the bottom. Wait 0.5s for stability, then close claw.
+                self._grab_timer = self.create_timer(0.5, self._close_claw_cb)
+            else:
+                # Reached the top. Sequence is totally finished.
+                self.pub_signal.publish(Bool(data=True))
+                self.get_logger().info("✅ Smooth grab sequence complete")
+        else:
+            # Haven't reached target yet, keep publishing the intermediate angle
+            self.publish_arm_angle(self.arm_angle)
 
     def _close_claw_cb(self):
         self._grab_timer.cancel()
         self.get_logger().info(f"Grab step 3: Closing claw to {self.CLAW_CLOSED}°")
         self.publish_claw(self.CLAW_CLOSED)
-        self._raise_timer = self.create_timer(1.0, self._raise_arm_cb)
 
-    def _raise_arm_cb(self):
+        # Wait 1.0s for the ball to be fully gripped, then start smooth raise
+        self._raise_timer = self.create_timer(1.0, self._start_raise_arm_cb)
+
+    def _start_raise_arm_cb(self):
         self._raise_timer.cancel()
-        self.get_logger().info(f"Grab step 4: Raising arm to {self.ARM_HORIZONTAL}°")
-        self.publish_arm_angle(self.ARM_HORIZONTAL)
-        self.pub_signal.publish(Bool(data=True))
-        self.get_logger().info("✅ Grab sequence complete")
+        self.get_logger().info(f"Grab step 4: Smoothly raising arm to {self.ARM_HORIZONTAL}°")
+
+        # Set target to top and start sweeping up
+        self._target_arm_angle = self.ARM_HORIZONTAL
+        self._arm_step_dir = 1.0  # Direction multiplier (moving up)
+        self._arm_sweep_timer = self.create_timer(0.02, self._sweep_arm_cb)
 
     # =====================================================
     # CREEP DONE
@@ -251,21 +285,53 @@ class BallChaser(Node):
                 f"Creeping at vx={cmd.linear.x:.2f} vy={cmd.linear.y:.2f} for ??s"
             )
             self.pub_cmd.publish(cmd)
-            self._creep_timer = self.create_timer(5.0, self._creep_done_cb)
+            self._creep_timer = self.create_timer(7.0, self._creep_done_cb)
             return
 
         # Far range — arm horizontal, approach ball
         self.publish_arm_angle(self.ARM_HORIZONTAL)
 
-        cmd = Twist()
+        # =====================================================
+        # HSV STATE MACHINE: ALIGN THEN DRIVE
+        # =====================================================
+        target_vx = 0.0
+        target_wz = 0.0
         err_dist = msg.z - self.target_dist
-        if abs(err_dist) > 0.05:
-            cmd.linear.x = max(-0.3, min(0.3, 0.5 * err_dist))
-            cmd.linear.y = max(-0.3, min(0.3, -1.0 * msg.x))
 
-        # ← Save last velocity so creep can continue in same direction
+        # 🚨 TRIPWIRE REMOVED: The robot will no longer stop to re-align!
+
+        # STATE 1: ALIGNING PHASE
+        if not self.is_aligned:
+            target_vx = 0.0  # Brakes applied
+
+            # Faster multiplier because HSV has no latency
+            target_wz = max(-0.4, min(0.4, -1.0 * msg.x))
+
+            # Tight 5cm window (HSV can easily hit this)
+            if abs(msg.x) < 0.05:
+                self.get_logger().info("Aligned! Driving forward with micro-corrections.")
+                self.is_aligned = True
+
+        # STATE 2: DRIVING PHASE
+        else:
+            # Drive straight towards the distance detected
+            target_vx = max(-0.3, min(0.3, 0.5 * err_dist))
+
+            # MICRO-CORRECTIONS: Steer gently while driving to fight mecanum drift
+            target_wz = max(-0.15, min(0.15, -0.5 * msg.x))
+
+        # APPLY SMOOTHER (Only to linear forward/back to prevent wheel slip)
+        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
+
+        cmd = Twist()
+        cmd.linear.x = self.current_vx
+        cmd.linear.y = 0.0  # Strictly zero to prevent crab-walking
+        cmd.angular.z = target_wz
+
+        # Save for the RealSense creep handoff
         self._last_zed_vx = cmd.linear.x
-        self._last_zed_vy = cmd.linear.y
+        self._last_zed_vy = 0.0
+
         self.pub_cmd.publish(cmd)
 
     # =====================================================
@@ -273,6 +339,8 @@ class BallChaser(Node):
     # Kept for logging/future use — motion is now timed creep
     # =====================================================
     def close_range_callback(self, msg):
+        self.get_logger().info("Entered real sense territory")
+        return
         if not self.is_active:
             return
 

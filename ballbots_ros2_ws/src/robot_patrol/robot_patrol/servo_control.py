@@ -201,8 +201,7 @@ class ServoControlNode(Node):
                 return
             self.arm_state = "BUSY"
 
-        self.get_logger().info("Ball ready signal received. Grabbing...")
-        threading.Thread(target=self.perform_grab, daemon=True).start()
+        self.get_logger().info("Ball ready signal received. (Grab handled by chaser!)")
 
     def perform_grab(self):
 

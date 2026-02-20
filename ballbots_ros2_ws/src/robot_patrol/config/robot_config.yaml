@@ -15,7 +15,7 @@
 
     # --- Claw Positions ---
     claw_open_deg: 152.0
-    claw_closed_deg: 173.0
+    claw_closed_deg: 175.0
 
     # --- Tracking Behavior ---
     target_dist: 0.2

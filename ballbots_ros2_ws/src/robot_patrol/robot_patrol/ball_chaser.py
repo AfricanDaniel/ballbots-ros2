@@ -335,6 +335,10 @@ class BallChaser(Node):
     # REALSENSE CALLBACK (close range: < tilt_start_dist)
     # Active HSV Tracking + State Machine
     # =====================================================
+    # =====================================================
+    # REALSENSE CALLBACK (close range: < tilt_start_dist)
+    # Active HSV Tracking + State Machine
+    # =====================================================
     def close_range_callback(self, msg):
         if not self.is_active or not self.use_close_cam or self.ball_grabbed:
             return
@@ -345,29 +349,29 @@ class BallChaser(Node):
         if msg.z > self.tilt_start_dist:
             return
 
-        # Valid reading — update time
         self.last_realsense_time = self.get_clock().now()
 
         # =====================================================
-        # BLIND SPOT GRAB (Now uses YAML grab_dist!)
+        # CLAW PHYSICAL OFFSET (Adjust this value!)
+        # -0.06 means "Keep the ball 6cm to the left of the camera center"
         # =====================================================
-        if msg.z <= self.grab_dist and abs(msg.x) < 0.06:
+        claw_offset_x = 0.01
+        err_x = msg.x - claw_offset_x
+
+        # =====================================================
+        # BLIND SPOT GRAB
+        # (Now uses err_x so it grabs when aligned with the CLAW)
+        # =====================================================
+        if msg.z <= self.grab_dist and abs(err_x) < 0.06:
             self.grab_confirm_count += 1
-            self.get_logger().info(
-                f"Grab confirm {self.grab_confirm_count}/{self.GRAB_CONFIRM_NEEDED} "
-                f"(x={msg.x:.3f}m)"
-            )
             if self.grab_confirm_count >= self.GRAB_CONFIRM_NEEDED:
                 self._cancel_creep_timer()
                 self.execute_grab()
             else:
-                self.stop_robot()  # Hold still while confirming
+                self.stop_robot()
             return
 
-        # =====================================================
-        # ARM TILT LOGIC REMOVED
-        # =====================================================
-        # Lock the arm horizontally so it stays out of the way during approach!
+        # Lock the arm horizontally
         self.publish_arm_angle(self.ARM_HORIZONTAL)
 
         # =====================================================
@@ -375,35 +379,28 @@ class BallChaser(Node):
         # =====================================================
         target_vx = 0.0
         target_wz = 0.0
-
-        # Drive towards 0.0m to guarantee we aggressively cross the grab_dist tripwire
         err_dist = msg.z - 0.0
 
-        # STATE 1: ALIGNING PHASE
+        # STATE 1: ALIGNING PHASE (Using err_x instead of msg.x)
         if not self.is_aligned:
-            target_vx = 0.0  # Hit the brakes!
+            target_vx = 0.0
+            target_wz = max(-0.25, min(0.25, -0.8 * err_x))
 
-            # Slower turning for close-range precision
-            target_wz = max(-0.25, min(0.25, -0.8 * msg.x))
-
-            # Very tight 3cm window since we are close
-            if abs(msg.x) < 0.03:
-                self.get_logger().info("RealSense Aligned! Final approach...")
+            if abs(err_x) < 0.03:
+                self.get_logger().info("RealSense Aligned with CLAW! Final approach...")
                 self.is_aligned = True
 
-        # STATE 2: DRIVING PHASE
+        # STATE 2: DRIVING PHASE (Using err_x instead of msg.x)
         else:
-            # Slower approach speed (max 0.15 m/s)
             target_vx = max(-0.15, min(0.15, 0.4 * err_dist))
-            # Micro-corrections to keep it dead center during approach
-            target_wz = max(-0.1, min(0.1, -0.5 * msg.x))
+            target_wz = max(-0.1, min(0.1, -0.5 * err_x))
 
-        # APPLY SMOOTHER (Prevents mecanum wheel slip)
+        # APPLY SMOOTHER
         self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
 
         cmd = Twist()
         cmd.linear.x = self.current_vx
-        cmd.linear.y = 0.0  # Strictly zero to prevent crab-walking
+        cmd.linear.y = 0.0
         cmd.angular.z = target_wz
         self.pub_cmd.publish(cmd)
 

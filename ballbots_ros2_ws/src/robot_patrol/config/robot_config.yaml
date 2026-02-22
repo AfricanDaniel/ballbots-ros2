@@ -20,4 +20,4 @@
     # --- Tracking Behavior ---
     target_dist: 0.2
     grab_dist: 0.16
-    tilt_start_dist: 1.0
+    tilt_start_dist: 0.6

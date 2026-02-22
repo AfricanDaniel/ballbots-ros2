@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, Twist
 from std_msgs.msg import Bool, Float32
+from nav_msgs.msg import Odometry
 from std_srvs.srv import SetBool
 import math
 import numpy as np
@@ -32,178 +33,290 @@ class BallChaser(Node):
         # =====================================================
         # LOAD PARAMETERS
         # =====================================================
-        self.ARM_HORIZONTAL  = self.get_parameter('arm_raised_deg').value
-        self.ARM_MAX_TILT    = self.get_parameter('arm_lowered_deg').value
-        self.CLAW_OPEN       = self.get_parameter('claw_open_deg').value
-        self.CLAW_CLOSED     = self.get_parameter('claw_closed_deg').value
-        self.target_dist     = self.get_parameter('target_dist').value
+        self.ARM_HORIZONTAL = self.get_parameter('arm_raised_deg').value
+        self.ARM_MAX_TILT = self.get_parameter('arm_lowered_deg').value
+        self.CLAW_OPEN = self.get_parameter('claw_open_deg').value
+        self.CLAW_CLOSED = self.get_parameter('claw_closed_deg').value
+        self.target_dist = self.get_parameter('target_dist').value
         self.tilt_start_dist = self.get_parameter('tilt_start_dist').value
         self.grab_dist = self.get_parameter('grab_dist').value
 
-        self.get_logger().info(
-            f"Params loaded | ARM_HORIZONTAL={self.ARM_HORIZONTAL} | ARM_MAX_TILT={self.ARM_MAX_TILT} | "
-            f"CLAW_OPEN={self.CLAW_OPEN} | CLAW_CLOSED={self.CLAW_CLOSED} | "
-            f"target_dist={self.target_dist} | tilt_start_dist={self.tilt_start_dist}"
-        )
+        # =====================================================
+        # PUBLISHERS & SUBSCRIBERS
+        # =====================================================
+        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pub_claw = self.create_publisher(Float32, '/claw_command', 10)
+        self.pub_arm = self.create_publisher(Float32, '/arm_command', 10)
+
+        # Vision Topics
+        self.sub_ball_zed = self.create_subscription(Point, '/tennis_ball_position', self.zed_callback, 10)
+        self.sub_ball_rs = self.create_subscription(Point, '/tennis_ball_position_close', self.rs_callback, 10)
+        self.sub_bottle = self.create_subscription(Point, '/bottle_position', self.bottle_callback, 10)
+
+        # Odometry for returning home
+        self.sub_odom = self.create_subscription(Odometry, '/zed/zed_node/odom', self.odom_callback, 10)
+
+        self.srv_start = self.create_service(SetBool, '/start_chasing', self.handle_start)
 
         # =====================================================
-        # SUBSCRIBERS / PUBLISHERS
+        # MISSION STATE MACHINE
         # =====================================================
-        self.sub_cam = self.create_subscription(
-            Point, '/tennis_ball_position', self.listener_callback, 10)
+        self.is_active = False
+        self.state = 'IDLE'  # SEARCHING, CHASING_ZED, CHASING_RS, GRABBING, TURNING_HOME, CHASING_BOTTLE, DROPPING
 
-        self.sub_cam_close = self.create_subscription(
-            Point, '/tennis_ball_position_close', self.close_range_callback, 10)
+        self.home_x = None
+        self.home_y = None
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_yaw = 0.0
 
-        self.pub_cmd    = self.create_publisher(Twist,   '/cmd_vel',      10)
-        self.pub_arm    = self.create_publisher(Float32, '/arm_command',  10)
-        self.pub_claw   = self.create_publisher(Float32, '/claw_command', 10)
-        self.pub_signal = self.create_publisher(Bool,    '/ball_ready',   10)
+        self.home_yaw = None
+        self.current_yaw = 0.0
 
-        # =====================================================
-        # SERVICES
-        # =====================================================
-        self.srv_start = self.create_service(SetBool, 'start_chasing', self.handle_start)
-        self.srv_stop  = self.create_service(SetBool, 'stop_chasing',  self.handle_stop)
-        self.srv_estop = self.create_service(SetBool, 'estop',         self.handle_estop)
-
-        # =====================================================
-        # STATE
-        # =====================================================
-        self.is_active         = False
-        self.arm_angle         = self.ARM_HORIZONTAL
-        self.claw_opened       = False
-        self.use_close_cam     = False
-        self.ball_grabbed      = False
-        self.grab_started      = False
-        self.last_realsense_time = None
-        self.grab_confirm_count  = 0
-        self.GRAB_CONFIRM_NEEDED = 3
-        self._creep_timer        = None
-        self._last_zed_vx = 0.0
-        self._last_zed_vy = 0.0
-
+        # Motion & Alignment tracking
         self.is_aligned = False
         self.current_vx = 0.0
         self.MAX_ACCEL = 0.02
 
-        # Watchdog disabled — using timed creep instead
-        self.create_timer(1.0, self.realsense_watchdog_cb)
+        # Grab/Drop tracking
+        self.grab_confirm_count = 0
+        self.GRAB_CONFIRM_NEEDED = 3
+        self.arm_angle = self.ARM_HORIZONTAL
+        self._active_action = None  # 'GRAB' or 'DROP'
 
-        self.get_logger().info(
-            f"Ball Chaser Ready | Horizontal: {self.ARM_HORIZONTAL} | "
-            f"Max Tilt: {self.ARM_MAX_TILT}"
-        )
+        # Main heartbeat timer for background states (Searching & Turning)
+        self.control_timer = self.create_timer(0.05, self.control_loop)
+
+        self.get_logger().info("Full Mission Ball Chaser node started!")
 
     # =====================================================
-    # SERVICE HANDLERS
+    # ODOMETRY & MISSION CONTROL
     # =====================================================
+    def odom_callback(self, msg: Odometry):
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
+
+        q = msg.pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        # Lock the exact X, Y, and Yaw the moment the mission is started
+        if self.home_x is None and self.is_active:
+            self.home_x = self.current_x
+            self.home_y = self.current_y
+            self.get_logger().info(f"📍 HOME LOCKED at X:{self.home_x:.2f}, Y:{self.home_y:.2f}")
+
     def handle_start(self, request, response):
         self.is_active = request.data
 
         if self.is_active:
             self.publish_arm_angle(self.ARM_HORIZONTAL)
-            self.grab_started        = False
-            self.claw_opened         = False
-            self.use_close_cam       = False
-            self.ball_grabbed        = False
-            self.last_realsense_time = None
-            self.grab_confirm_count  = 0
-            self._cancel_creep_timer()
-            self.is_aligned = False
-            msg = "Chasing Started!"
+            self.publish_claw(self.CLAW_OPEN)
+            self.home_yaw = None  # Forces Odom to record a fresh home direction
+            self.state = 'SEARCHING'
+            self.get_logger().info("🚀 MISSION STARTED: Searching for balls!")
+            msg = "Mission Started!"
         else:
-            self.publish_arm_angle(self.ARM_HORIZONTAL)
+            self.state = 'IDLE'
             self.stop_robot()
-            self._cancel_creep_timer()
-            msg = "Chasing Stopped."
+            msg = "Mission Stopped!"
 
-        self.get_logger().info(msg)
         response.success = True
         response.message = msg
         return response
-
-    def handle_stop(self, request, response):
-        return self.handle_start(request, response)
-
-    def handle_estop(self, request, response):
-        self.is_active           = False
-        self.grab_started        = False
-        self.use_close_cam       = False
-        self.ball_grabbed        = False
-        self.last_realsense_time = None
-        self.grab_confirm_count  = 0
-        self._cancel_creep_timer()
-        self.stop_robot()
-        response.success = True
-        response.message = "E-Stop triggered"
-        self.get_logger().info("🛑 E-Stop!")
-        return response
-
-    # =====================================================
-    # HELPERS
-    # =====================================================
-    def _cancel_creep_timer(self):
-        if self._creep_timer is not None:
-            self._creep_timer.cancel()
-            self._creep_timer = None
-
-    def publish_arm_angle(self, angle):
-        self.arm_angle = angle
-        msg = Float32()
-        msg.data = float(angle)
-        self.pub_arm.publish(msg)
-
-    def publish_claw(self, value):
-        msg = Float32()
-        msg.data = float(value)
-        self.pub_claw.publish(msg)
-
-    def stop_robot(self):
-        self.pub_cmd.publish(Twist())
-
-    # =====================================================
-    # WATCHDOG — disabled, kept for reference
-    # =====================================================
-    def realsense_watchdog_cb(self):
-        return  # disabled — using timed creep on switch instead
-
-    # =====================================================
-    # GRAB SEQUENCE
-    # Step 1: Open claw
-    # Step 2: Lower arm to ARM_MAX_TILT
-    # Step 3: Close claw (after 1s delay)
-    # Step 4: Raise arm back to horizontal
-    # =====================================================
-    # =====================================================
-    # GRAB SEQUENCE (Smooth Interpolation)
-    # =====================================================
-    def execute_grab(self):
-        if self.ball_grabbed:
+    ###
+    def control_loop(self):
+        """Runs at 20Hz to control states that don't depend on camera callbacks"""
+        if not self.is_active:
             return
 
-        self.get_logger().info("🎾 ========================================")
-        self.get_logger().info("🎾 BALL GRABBED — executing smooth grab sequence")
-        self.get_logger().info("🎾 ========================================")
+        cmd = Twist()
 
+        # STATE: SEARCHING
+        if self.state == 'SEARCHING':
+            cmd.angular.z = 0.3  # Spin slowly left
+            self.pub_cmd.publish(cmd)
+
+        # STATE: TURNING HOME
+        elif self.state == 'TURNING_HOME':
+            if self.home_x is None or self.home_y is None:
+                self.state = 'SEARCHING_BOTTLE'  # Failsafe
+                return
+
+            # Calculate angle pointing back to the starting (X,Y) coordinate
+            angle_to_home = math.atan2(self.home_y - self.current_y, self.home_x - self.current_x)
+            diff = (angle_to_home - self.current_yaw + math.pi) % (2 * math.pi) - math.pi
+
+            # If we are facing home, stop and look for the bottle
+            if abs(diff) < 0.15:
+                self.stop_robot()
+                self.is_aligned = False
+                self.state = 'SEARCHING_BOTTLE'
+                self.get_logger().info("↩️ Pointing Home! Sweeping for bottle...")
+            else:
+                # Proportional turn back to home
+                cmd.angular.z = max(-0.4, min(0.4, 1.0 * diff))
+                self.pub_cmd.publish(cmd)
+
+        # STATE: SEARCHING BOTTLE (Fallback if not immediately seen)
+        elif self.state == 'SEARCHING_BOTTLE':
+            cmd.angular.z = 0.3  # Spin slowly left until the camera spots it
+            self.pub_cmd.publish(cmd)
+
+    # =====================================================
+    # ZED CALLBACK (Far Range Ball)
+    # =====================================================
+    def zed_callback(self, msg):
+        if not self.is_active: return
+
+        # If searching and we see a ball, switch to chase mode!
+        if self.state == 'SEARCHING':
+            self.get_logger().info("🎾 BALL SPOTTED! Chasing...")
+            self.state = 'CHASING_ZED'
+            self.is_aligned = False
+
+        if self.state != 'CHASING_ZED': return
+
+        # Handoff to RealSense when close
+        if msg.z < self.tilt_start_dist:
+            self.get_logger().info(f"Handoff to RealSense at {msg.z:.2f}m")
+            self.state = 'CHASING_RS'
+            self.stop_robot()
+            self.is_aligned = False
+            self.grab_confirm_count = 0
+            return
+
+        # STATE MACHINE: ALIGN THEN DRIVE
+        target_vx = 0.0
+        target_wz = 0.0
+
+        if not self.is_aligned:
+            target_wz = max(-0.4, min(0.4, -1.0 * msg.x))
+            if abs(msg.x) < 0.05:
+                self.is_aligned = True
+        else:
+            target_vx = max(-0.3, min(0.3, 0.5 * (msg.z - self.target_dist)))
+            target_wz = max(-0.15, min(0.15, -0.5 * msg.x))
+
+        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
+
+        cmd = Twist()
+        cmd.linear.x = self.current_vx
+        cmd.angular.z = target_wz
+        self.pub_cmd.publish(cmd)
+
+    # =====================================================
+    # REALSENSE CALLBACK (Close Range Ball)
+    # =====================================================
+    def rs_callback(self, msg):
+        if not self.is_active or self.state != 'CHASING_RS': return
+        if math.isnan(msg.z) or msg.z <= 0.0: return
+
+        # Physical Claw Offset (Adjust this to center ball in claw!)
+        claw_offset_x = 0.01
+        err_x = msg.x - claw_offset_x
+
+        # GRAB TRIGGER
+        if msg.z <= self.grab_dist and abs(err_x) < 0.06:
+            self.grab_confirm_count += 1
+            if self.grab_confirm_count >= self.GRAB_CONFIRM_NEEDED:
+                self.execute_grab()
+            else:
+                self.stop_robot()
+            return
+
+        # STATE MACHINE: ALIGN THEN DRIVE
+        target_vx = 0.0
+        target_wz = 0.0
+
+        if not self.is_aligned:
+            target_wz = max(-0.25, min(0.25, -0.8 * err_x))
+            if abs(err_x) < 0.03:
+                self.is_aligned = True
+        else:
+            target_vx = max(-0.15, min(0.15, 0.4 * msg.z))
+            target_wz = max(-0.1, min(0.1, -0.5 * err_x))
+
+        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
+
+        cmd = Twist()
+        cmd.linear.x = self.current_vx
+        cmd.angular.z = target_wz
+        self.pub_cmd.publish(cmd)
+
+    # =====================================================
+    # BOTTLE CALLBACK (Dropping off)
+    # =====================================================
+    def bottle_callback(self, msg):
+        if not self.is_active: return
+        if math.isnan(msg.z) or msg.z <= 0.0: return
+
+        # ONLY interrupt if we have finished our Odometry turn and are actively searching!
+        if self.state == 'SEARCHING_BOTTLE':
+            self.get_logger().info("🧴 PINK BOTTLE SPOTTED! Visual Servoing taking over...")
+            self.state = 'CHASING_BOTTLE'
+            self.is_aligned = False
+
+        if self.state != 'CHASING_BOTTLE': return
+
+        # We stop a bit further from the bottle (20cm) so we don't crash into it
+        drop_dist = 0.40
+        err_dist = msg.z - drop_dist
+
+        # DROP TRIGGER
+        if msg.z <= drop_dist and abs(msg.x) < 0.05:
+            self.execute_drop()
+            return
+
+        # STATE MACHINE: ALIGN THEN DRIVE
+        target_vx = 0.0
+        target_wz = 0.0
+
+        if not self.is_aligned:
+            target_wz = max(-0.3, min(0.3, -0.8 * msg.x))
+            if abs(msg.x) < 0.05:
+                self.is_aligned = True
+        else:
+            target_vx = max(-0.2, min(0.2, 0.5 * err_dist))
+            target_wz = max(-0.1, min(0.1, -0.5 * msg.x))
+
+        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
+
+        cmd = Twist()
+        cmd.linear.x = self.current_vx
+        cmd.angular.z = target_wz
+        self.pub_cmd.publish(cmd)
+
+    # =====================================================
+    # ARM KINEMATICS (GRAB & DROP)
+    # =====================================================
+    def execute_grab(self):
+        self.get_logger().info("======================================")
+        self.get_logger().info("🎾 BALL SECURED — Executing Grab...")
+        self.state = 'GRABBING'
         self.stop_robot()
-        self.ball_grabbed = True
-        self.grab_started = True
-
-        # Step 1: Open claw
         self.publish_claw(self.CLAW_OPEN)
-
-        # Step 2: Start smoothly lowering the arm
         self._target_arm_angle = self.ARM_MAX_TILT
-        self._arm_step_dir = -1.0  # Direction multiplier (moving down)
-        self._arm_sweep_timer = self.create_timer(0.02, self._sweep_arm_cb)  # 50Hz update rate
+        self._arm_step_dir = -1.0
+        self._active_action = 'GRAB'
+        self._arm_sweep_timer = self.create_timer(0.02, self._sweep_arm_cb)
+
+    def execute_drop(self):
+        self.get_logger().info("======================================")
+        self.get_logger().info("🧴 BOTTLE REACHED — Executing Drop...")
+        self.state = 'DROPPING'
+        self.stop_robot()
+        self._target_arm_angle = self.ARM_MAX_TILT
+        self._arm_step_dir = -1.0
+        self._active_action = 'DROP'
+        self._arm_sweep_timer = self.create_timer(0.02, self._sweep_arm_cb)
 
     def _sweep_arm_cb(self):
-        """Slowly moves the arm 1 degree per tick until it hits the target"""
-        step_size = 1.0  # Move 1 degree every 0.02s
+        """Universal smooth arm sweep for both grabbing and dropping"""
+        step_size = 1.0
         self.arm_angle += (step_size * self._arm_step_dir)
 
-        # Check if we have reached or passed the target angle
         if (self._arm_step_dir < 0 and self.arm_angle <= self._target_arm_angle) or \
                 (self._arm_step_dir > 0 and self.arm_angle >= self._target_arm_angle):
 
@@ -211,214 +324,67 @@ class BallChaser(Node):
             self.publish_arm_angle(self.arm_angle)
             self._arm_sweep_timer.cancel()
 
-            # State routing: Did we just finish going down, or up?
             if self.arm_angle == self.ARM_MAX_TILT:
-                # Reached the bottom. Wait 0.5s for stability, then close claw.
-                self._grab_timer = self.create_timer(0.5, self._close_claw_cb)
+                # Reached the floor. What are we doing?
+                if self._active_action == 'GRAB':
+                    self._action_timer = self.create_timer(0.5, self._close_claw_cb)
+                else:
+                    self._action_timer = self.create_timer(0.5, self._open_claw_drop_cb)
             else:
-                # Reached the top. Sequence is totally finished.
-                self.pub_signal.publish(Bool(data=True))
-                self.get_logger().info("✅ Smooth grab sequence complete")
+                # Reached the top. Sequence complete!
+                if self._active_action == 'GRAB':
+                    self.get_logger().info("✅ Grab complete. Turning back home.")
+                    self.state = 'TURNING_HOME'
+                else:
+                    self.get_logger().info("✅ Drop complete. Searching for next ball!")
+                    self.state = 'SEARCHING'
         else:
-            # Haven't reached target yet, keep publishing the intermediate angle
             self.publish_arm_angle(self.arm_angle)
 
     def _close_claw_cb(self):
-        self._grab_timer.cancel()
-        self.get_logger().info(f"Grab step 3: Closing claw to {self.CLAW_CLOSED}°")
+        self._action_timer.cancel()
         self.publish_claw(self.CLAW_CLOSED)
+        self._action_timer = self.create_timer(1.0, self._start_raise_arm_cb)
 
-        # Wait 1.0s for the ball to be fully gripped, then start smooth raise
-        self._raise_timer = self.create_timer(1.0, self._start_raise_arm_cb)
+    def _open_claw_drop_cb(self):
+        self._action_timer.cancel()
+        self.publish_claw(self.CLAW_OPEN)
+        self._action_timer = self.create_timer(1.0, self._start_raise_arm_cb)
 
     def _start_raise_arm_cb(self):
-        self._raise_timer.cancel()
-        self.get_logger().info(f"Grab step 4: Smoothly raising arm to {self.ARM_HORIZONTAL}°")
-
-        # Set target to top and start sweeping up
+        self._action_timer.cancel()
         self._target_arm_angle = self.ARM_HORIZONTAL
-        self._arm_step_dir = 1.0  # Direction multiplier (moving up)
+        self._arm_step_dir = 1.0
         self._arm_sweep_timer = self.create_timer(0.02, self._sweep_arm_cb)
 
     # =====================================================
-    # CREEP DONE
+    # UTILS
     # =====================================================
-    def _creep_done_cb(self):
-        self._cancel_creep_timer()
-        self.get_logger().info("Creep done — stopping and executing grab")
-        self.stop_robot()
-        self.execute_grab()
+    def stop_robot(self):
+        self.current_vx = 0.0
+        self.pub_cmd.publish(Twist())
 
-    # =====================================================
-    # ZED CALLBACK (far range: > tilt_start_dist)
-    # =====================================================
-    def listener_callback(self, msg):
-        if not self.is_active:
-            return
+    def publish_arm_angle(self, angle_deg):
+        self.arm_angle = angle_deg
+        msg = Float32()
+        msg.data = float(angle_deg)
+        self.pub_arm.publish(msg)
 
-        if self.ball_grabbed:
-            return
-
-        if math.isnan(msg.z) or msg.z <= 0.0:
-            self.stop_robot()
-            return
-
-        # Once use_close_cam is set, NEVER reset it from the ZED callback
-        # (prevents flag flipping if ZED sends a stale far reading after switch)
-        if self.use_close_cam:
-            return
-
-        # Hand off to RealSense when close
-        if msg.z < self.tilt_start_dist:
-            self.get_logger().info(
-                f"ZED z={msg.z:.2f}m < {self.tilt_start_dist:.2f}m — Handoff to RealSense!"
-            )
-            self.use_close_cam = True
-
-            # Open claw, stop the robot, and reset alignment for the RealSense
-            self.publish_claw(self.CLAW_OPEN)
-            self.stop_robot()
-            self.is_aligned = False
-            return
-
-        # Far range — arm horizontal, approach ball
-        self.publish_arm_angle(self.ARM_HORIZONTAL)
-
-        # =====================================================
-        # HSV STATE MACHINE: ALIGN THEN DRIVE
-        # =====================================================
-        target_vx = 0.0
-        target_wz = 0.0
-        err_dist = msg.z - self.target_dist
-
-        # 🚨 TRIPWIRE REMOVED: The robot will no longer stop to re-align!
-
-        # STATE 1: ALIGNING PHASE
-        if not self.is_aligned:
-            target_vx = 0.0  # Brakes applied
-
-            # Faster multiplier because HSV has no latency
-            target_wz = max(-0.4, min(0.4, -1.0 * msg.x))
-
-            # Tight 5cm window (HSV can easily hit this)
-            if abs(msg.x) < 0.05:
-                self.get_logger().info("Aligned! Driving forward with micro-corrections.")
-                self.is_aligned = True
-
-        # STATE 2: DRIVING PHASE
-        else:
-            # Drive straight towards the distance detected
-            target_vx = max(-0.3, min(0.3, 0.5 * err_dist))
-
-            # MICRO-CORRECTIONS: Steer gently while driving to fight mecanum drift
-            target_wz = max(-0.15, min(0.15, -0.5 * msg.x))
-
-        # APPLY SMOOTHER (Only to linear forward/back to prevent wheel slip)
-        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
-
-        cmd = Twist()
-        cmd.linear.x = self.current_vx
-        cmd.linear.y = 0.0  # Strictly zero to prevent crab-walking
-        cmd.angular.z = target_wz
-
-        # Save for the RealSense creep handoff
-        self._last_zed_vx = cmd.linear.x
-        self._last_zed_vy = 0.0
-
-        self.pub_cmd.publish(cmd)
-
-    # =====================================================
-    # REALSENSE CALLBACK (close range: < tilt_start_dist)
-    # Active HSV Tracking + State Machine
-    # =====================================================
-    # =====================================================
-    # REALSENSE CALLBACK (close range: < tilt_start_dist)
-    # Active HSV Tracking + State Machine
-    # =====================================================
-    # =====================================================
-    # REALSENSE CALLBACK (close range: < tilt_start_dist)
-    # Active HSV Tracking + State Machine
-    # =====================================================
-    def close_range_callback(self, msg):
-        if not self.is_active or not self.use_close_cam or self.ball_grabbed:
-            return
-
-        if math.isnan(msg.z) or msg.z <= 0.0:
-            return
-
-        if msg.z > self.tilt_start_dist:
-            return
-
-        self.last_realsense_time = self.get_clock().now()
-
-        # =====================================================
-        # CLAW PHYSICAL OFFSET (Adjust this value!)
-        # -0.06 means "Keep the ball 6cm to the left of the camera center"
-        # =====================================================
-        claw_offset_x = 0.01
-        err_x = msg.x - claw_offset_x
-
-        # =====================================================
-        # BLIND SPOT GRAB
-        # (Now uses err_x so it grabs when aligned with the CLAW)
-        # =====================================================
-        if msg.z <= self.grab_dist and abs(err_x) < 0.06:
-            self.grab_confirm_count += 1
-            if self.grab_confirm_count >= self.GRAB_CONFIRM_NEEDED:
-                self._cancel_creep_timer()
-                self.execute_grab()
-            else:
-                self.stop_robot()
-            return
-
-        # Lock the arm horizontally
-        self.publish_arm_angle(self.ARM_HORIZONTAL)
-
-        # =====================================================
-        # HSV STATE MACHINE: CLOSE RANGE PRECISION
-        # =====================================================
-        target_vx = 0.0
-        target_wz = 0.0
-        err_dist = msg.z - 0.0
-
-        # STATE 1: ALIGNING PHASE (Using err_x instead of msg.x)
-        if not self.is_aligned:
-            target_vx = 0.0
-            target_wz = max(-0.25, min(0.25, -0.8 * err_x))
-
-            if abs(err_x) < 0.03:
-                self.get_logger().info("RealSense Aligned with CLAW! Final approach...")
-                self.is_aligned = True
-
-        # STATE 2: DRIVING PHASE (Using err_x instead of msg.x)
-        else:
-            target_vx = max(-0.15, min(0.15, 0.4 * err_dist))
-            target_wz = max(-0.1, min(0.1, -0.5 * err_x))
-
-        # APPLY SMOOTHER
-        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
-
-        cmd = Twist()
-        cmd.linear.x = self.current_vx
-        cmd.linear.y = 0.0
-        cmd.angular.z = target_wz
-        self.pub_cmd.publish(cmd)
+    def publish_claw(self, angle_deg):
+        msg = Float32()
+        msg.data = float(angle_deg)
+        self.pub_claw.publish(msg)
 
 
-# =====================================================
-# MAIN
-# =====================================================
 def main(args=None):
     rclpy.init(args=args)
     node = BallChaser()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.get_logger().info("Shutting down — stopping robot...")
-        node.stop_robot()
+        node.pub_cmd.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
 

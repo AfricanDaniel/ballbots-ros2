@@ -7,7 +7,9 @@ from nav_msgs.msg import Odometry
 from std_srvs.srv import SetBool
 import math
 import numpy as np
-
+import tf2_ros
+from geometry_msgs.msg import PointStamped
+import tf2_geometry_msgs
 
 class BallChaser(Node):
 
@@ -58,6 +60,11 @@ class BallChaser(Node):
 
         self.srv_start = self.create_service(SetBool, '/start_chasing', self.handle_start)
 
+        # TF
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
         # =====================================================
         # MISSION STATE MACHINE
         # =====================================================
@@ -69,9 +76,14 @@ class BallChaser(Node):
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_yaw = 0.0
+        self._search_spinning = False
+        self._search_timer = None
 
         self.home_yaw = None
         self.current_yaw = 0.0
+
+        self._bottle_confirm_count = 0
+        self.BOTTLE_CONFIRM_NEEDED = 2  # must see bottle 5 frames in a row
 
         # Motion & Alignment tracking
         self.is_aligned = False
@@ -83,9 +95,15 @@ class BallChaser(Node):
         self.GRAB_CONFIRM_NEEDED = 3
         self.arm_angle = self.ARM_HORIZONTAL
         self._active_action = None  # 'GRAB' or 'DROP'
+        # Drop zone exclusion
+        self._drop_position = None
+        self.DROP_EXCLUSION_RADIUS = 0.2
 
         # Main heartbeat timer for background states (Searching & Turning)
         self.control_timer = self.create_timer(0.05, self.control_loop)
+
+        #reset timer if we have not seen it in a while
+        self.create_timer(0.1, self._bottle_confirm_reset_cb)
 
         self.get_logger().info("Full Mission Ball Chaser node started!")
 
@@ -141,28 +159,72 @@ class BallChaser(Node):
         # STATE: TURNING HOME
         elif self.state == 'TURNING_HOME':
             if self.home_x is None or self.home_y is None:
-                self.state = 'SEARCHING_BOTTLE'  # Failsafe
+                self.state = 'SEARCHING_BOTTLE'
                 return
 
-            # Calculate angle pointing back to the starting (X,Y) coordinate
+            dist_from_home = math.sqrt(
+                (self.current_x - self.home_x) ** 2 +
+                (self.current_y - self.home_y) ** 2
+            )
+
+            # Already at home — skip turning, go straight to bottle search
+            if dist_from_home < 0.3:
+                self.get_logger().info("📍 Already near home — skipping turn")
+                self.state = 'SEARCHING_BOTTLE'
+                return
+
+            # Calculate angle pointing back to home coordinates
             angle_to_home = math.atan2(self.home_y - self.current_y, self.home_x - self.current_x)
             diff = (angle_to_home - self.current_yaw + math.pi) % (2 * math.pi) - math.pi
 
-            # If we are facing home, stop and look for the bottle
             if abs(diff) < 0.15:
                 self.stop_robot()
                 self.is_aligned = False
-                self.state = 'SEARCHING_BOTTLE'
-                self.get_logger().info("↩️ Pointing Home! Sweeping for bottle...")
+                self._search_spinning = False
+                if self._search_timer is not None:
+                    self._search_timer.cancel()
+                    self._search_timer = None
+
+                # Try to face bottle TF before spinning blindly
+                try:
+                    tf = self.tf_buffer.lookup_transform(
+                        'base_link', 'neon_bottle',
+                        rclpy.time.Time(),
+                        timeout=rclpy.duration.Duration(seconds=0.1)
+                    )
+                    bx = tf.transform.translation.x
+                    bz = tf.transform.translation.z
+                    angle_to_bottle = math.atan2(bx, bz)
+                    self.get_logger().info(
+                        f"↩️ Home! Bottle TF at angle={math.degrees(angle_to_bottle):.1f}° — turning to face it")
+                    self._bottle_target_angle = self.current_yaw + angle_to_bottle
+                    self.state = 'TURNING_TO_BOTTLE'
+                except Exception:
+                    self.get_logger().info("↩️ Home! No bottle TF — sweeping...")
+                    self.state = 'SEARCHING_BOTTLE'
             else:
-                # Proportional turn back to home
+                # Still turning toward home
                 cmd.angular.z = max(-0.4, min(0.4, 1.0 * diff))
+                self.pub_cmd.publish(cmd)
+
+        # STATE: TURNING TO BOTTLE (using last known TF)
+        elif self.state == 'TURNING_TO_BOTTLE':
+            diff_bottle = (self._bottle_target_angle - self.current_yaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(diff_bottle) < 0.15:
+                self.stop_robot()
+                self.state = 'SEARCHING_BOTTLE'
+                self.get_logger().info("🎯 Facing bottle direction — confirming visually...")
+            else:
+                cmd.angular.z = max(-0.3, min(0.3, 1.0 * diff_bottle))
                 self.pub_cmd.publish(cmd)
 
         # STATE: SEARCHING BOTTLE (Fallback if not immediately seen)
         elif self.state == 'SEARCHING_BOTTLE':
-            cmd.angular.z = 0.3  # Spin slowly left until the camera spots it
-            self.pub_cmd.publish(cmd)
+            if not self._search_spinning:
+                cmd.angular.z = 0.15
+                self.pub_cmd.publish(cmd)
+                self._search_spinning = True
+                self._search_timer = self.create_timer(0.5, self._search_pause_cb)
 
     # =====================================================
     # ZED CALLBACK (Far Range Ball)
@@ -170,29 +232,38 @@ class BallChaser(Node):
     def zed_callback(self, msg):
         if not self.is_active: return
 
-        # If searching and we see a ball, switch to chase mode!
         if self.state == 'SEARCHING':
+            # Ignore ball if too close to drop zone
+            if self._drop_position is not None:
+                dist_from_drop = math.sqrt(
+                    (self.current_x - self._drop_position[0]) ** 2 +
+                    (self.current_y - self._drop_position[1]) ** 2
+                )
+                if dist_from_drop < self.DROP_EXCLUSION_RADIUS:
+                    return
+            self.stop_robot()
             self.get_logger().info("🎾 BALL SPOTTED! Chasing...")
             self.state = 'CHASING_ZED'
             self.is_aligned = False
+            return
 
         if self.state != 'CHASING_ZED': return
 
-        # Handoff to RealSense when close
-        if msg.z < self.tilt_start_dist:
-            self.get_logger().info(f"Handoff to RealSense at {msg.z:.2f}m")
-            self.state = 'CHASING_RS'
-            self.stop_robot()
-            self.is_aligned = False
-            self.grab_confirm_count = 0
+        # ← ADD: grab trigger before anything else
+        if msg.z <= self.grab_dist and abs(msg.x) < 0.06:
+            self.grab_confirm_count += 1
+            if self.grab_confirm_count >= self.GRAB_CONFIRM_NEEDED:
+                self.execute_grab()
+            else:
+                self.stop_robot()
             return
 
-        # STATE MACHINE: ALIGN THEN DRIVE
+        # Align then drive
         target_vx = 0.0
         target_wz = 0.0
 
         if not self.is_aligned:
-            target_wz = max(-0.4, min(0.4, -1.0 * msg.x))
+            target_wz = max(-0.25, min(0.25, -0.6 * msg.x))
             if abs(msg.x) < 0.05:
                 self.is_aligned = True
         else:
@@ -200,7 +271,6 @@ class BallChaser(Node):
             target_wz = max(-0.15, min(0.15, -0.5 * msg.x))
 
         self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
-
         cmd = Twist()
         cmd.linear.x = self.current_vx
         cmd.angular.z = target_wz
@@ -252,41 +322,70 @@ class BallChaser(Node):
         if not self.is_active: return
         if math.isnan(msg.z) or msg.z <= 0.0: return
 
-        # ONLY interrupt if we have finished our Odometry turn and are actively searching!
         if self.state == 'SEARCHING_BOTTLE':
-            self.get_logger().info("🧴 PINK BOTTLE SPOTTED! Visual Servoing taking over...")
+            self._bottle_confirm_count += 1
+            self.get_logger().info(f"🧴 Bottle seen ({self._bottle_confirm_count}/3)")
+            if self._bottle_confirm_count < 3:  # was 5, reduce to 3
+                # Stop spinning immediately even before confirmed
+                self.stop_robot()  # ← ADD THIS — kill spin on first sight
+                self._search_spinning = False
+                if self._search_timer is not None:
+                    self._search_timer.cancel()
+                    self._search_timer = None
+                return
+            self.get_logger().info("🧴 PINK BOTTLE CONFIRMED!")
+            self._bottle_confirm_count = 0
             self.state = 'CHASING_BOTTLE'
-            self.is_aligned = False
+            return
 
         if self.state != 'CHASING_BOTTLE': return
 
-        # We stop a bit further from the bottle (20cm) so we don't crash into it
         drop_dist = 0.40
-        err_dist = msg.z - drop_dist
 
         # DROP TRIGGER
-        if msg.z <= drop_dist and abs(msg.x) < 0.05:
-            self.execute_drop()
+        if msg.z <= drop_dist and abs(msg.x) < 0.08:
+            if self.state == 'CHASING_BOTTLE':  # ← only trigger once
+                self.execute_drop()
             return
 
-        # STATE MACHINE: ALIGN THEN DRIVE
-        target_vx = 0.0
-        target_wz = 0.0
+        # Simple proportional control — same as ball chase, no acceleration ramp
+        err_dist = msg.z - drop_dist
+        target_vx = max(-0.25, min(0.25, 0.5 * err_dist))  # was 0.15 max, now 0.25
+        target_wz = max(-0.3, min(0.3, -0.6 * msg.x))  # was 0.3 max, now 0.6 gain
 
-        if not self.is_aligned:
-            target_wz = max(-0.3, min(0.3, -0.8 * msg.x))
-            if abs(msg.x) < 0.05:
-                self.is_aligned = True
-        else:
-            target_vx = max(-0.2, min(0.2, 0.5 * err_dist))
-            target_wz = max(-0.1, min(0.1, -0.5 * msg.x))
+        # Only stop forward motion if very off-center
+        if abs(msg.x) > 0.25:  # was 0.20
+            target_vx = 0.0
 
-        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
-
+        # Skip MAX_ACCEL ramp — publish directly like zed_callback does
         cmd = Twist()
-        cmd.linear.x = self.current_vx
+        cmd.linear.x = target_vx
         cmd.angular.z = target_wz
         self.pub_cmd.publish(cmd)
+
+    def _bottle_confirm_reset_cb(self):
+        pass
+        # If no bottle message arrived recently, reset counter
+        # This is handled implicitly — bottle_callback only increments when called
+        # So if bottle disappears for a frame, we need to decay the counter
+        # if self.state == 'SEARCHING_BOTTLE':
+        #     if self._bottle_confirm_count > 0:
+        #         self._bottle_confirm_count = max(0, self._bottle_confirm_count - 1)
+
+    def _search_pause_cb(self):
+        """Called after spin burst — stop and wait for sharp frame"""
+        if self._search_timer is not None:
+            self._search_timer.cancel()
+            self._search_timer = None
+        self.stop_robot()
+        self._search_timer = self.create_timer(0.3, self._search_resume_cb)
+
+    def _search_resume_cb(self):
+        """Called after pause — ready for next spin burst"""
+        if self._search_timer is not None:
+            self._search_timer.cancel()
+            self._search_timer = None
+        self._search_spinning = False
 
     # =====================================================
     # ARM KINEMATICS (GRAB & DROP)
@@ -296,6 +395,8 @@ class BallChaser(Node):
         self.get_logger().info("🎾 BALL SECURED — Executing Grab...")
         self.state = 'GRABBING'
         self.stop_robot()
+        self.current_vx = 0.0  # ← force reset acceleration
+        self.is_aligned = False  # ← reset alignment for next chase
         self.publish_claw(self.CLAW_OPEN)
         self._target_arm_angle = self.ARM_MAX_TILT
         self._arm_step_dir = -1.0
@@ -337,6 +438,7 @@ class BallChaser(Node):
                     self.state = 'TURNING_HOME'
                 else:
                     self.get_logger().info("✅ Drop complete. Searching for next ball!")
+                    self._drop_position = (self.current_x, self.current_y)
                     self.state = 'SEARCHING'
         else:
             self.publish_arm_angle(self.arm_angle)

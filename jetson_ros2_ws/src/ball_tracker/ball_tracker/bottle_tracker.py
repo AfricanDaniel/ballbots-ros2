@@ -17,6 +17,14 @@ class BottleTracker(Node):
     def __init__(self):
         super().__init__('bottle_tracker')
 
+        # ============================================================
+        # EASY VALIDATION TOGGLE - CHANGE THIS FOR TESTING!
+        # ============================================================
+        # False = largest pink blob only
+        # True  = use aspect ratio + depth validation
+        self.ENABLE_VALIDATION = True  # <-- CHANGE THIS LINE
+        # ============================================================
+
         self.bridge = CvBridge()
 
         # Subscribers
@@ -36,6 +44,7 @@ class BottleTracker(Node):
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.frame_count = 0
+
 
         self.get_logger().info("=" * 60)
         self.get_logger().info("Pink Bottle Tracker node started! (With Wrap-Around HSV)")
@@ -65,57 +74,117 @@ class BottleTracker(Node):
         # Color Profiler Tool
         center_hsv = hsv[h // 2, w // 2]
         self.frame_count += 1
-        # if self.frame_count % 30 == 0:
-        #     self.get_logger().info(f"Center Crosshair HSV: H={center_hsv[0]}, S={center_hsv[1]}, V={center_hsv[2]}")
+        if self.frame_count % 30 == 0:
+            # Sample a 20x20 region around center instead of single pixel
+            margin = 10
+            sample = hsv[h // 2 - margin:h // 2 + margin, w // 2 - margin:w // 2 + margin]
+            valid = sample[sample[:, :, 1] > 20]  # ignore near-gray pixels
+            if len(valid) > 0:
+                h_med = int(np.median(valid[:, 0]))
+                s_med = int(np.median(valid[:, 1]))
+                v_med = int(np.median(valid[:, 2]))
+                self.get_logger().info(
+                    f"Center 20x20 HSV median: H={h_med}, S={s_med}, V={v_med}")
+            else:
+                self.get_logger().info(f"Center pixel HSV: H={center_hsv[0]}, S={center_hsv[1]}, V={center_hsv[2]}")
 
         cv2.circle(debug_img, (w // 2, h // 2), 4, (255, 255, 255), -1)
         cv2.circle(debug_img, (w // 2, h // 2), 2, (0, 0, 0), -1)
 
-        # HSV Range (Wrap-around)
-        mask1 = cv2.inRange(hsv, (0, 120, 100), (15, 255, 255))
-        mask2 = cv2.inRange(hsv, (165, 120, 100), (179, 255, 255))
-        mask = cv2.bitwise_or(mask1, mask2)
+        # HSV Range
+        self.INDOOR_MODE = False  # True = tennis court
+        self.SALMON_MODE = False  # True = salmon/faded pink bottle
+        self.YELLOW_MODE = False  # True = tall yellow bottle
+        self.BLUE_MODE = True  # ← True = blue bottle
+
+        if self.YELLOW_MODE:
+            mask = cv2.inRange(hsv, (20, 80, 80), (35, 255, 255))
+        elif self.BLUE_MODE:
+            mask = cv2.inRange(hsv, (100, 80, 80), (130, 255, 255))
+        elif self.SALMON_MODE:
+            mask1 = cv2.inRange(hsv, (0, 30, 60), (20, 255, 255))
+            mask2 = cv2.inRange(hsv, (160, 30, 60), (179, 255, 255))
+            mask = cv2.bitwise_or(mask1, mask2)
+        elif self.INDOOR_MODE:
+            mask1 = cv2.inRange(hsv, (0, 90, 80), (12, 255, 255))
+            mask2 = cv2.inRange(hsv, (168, 90, 80), (179, 255, 255))
+            mask = cv2.bitwise_or(mask1, mask2)
+        else:
+            mask1 = cv2.inRange(hsv, (0, 60, 60), (15, 255, 255))
+            mask2 = cv2.inRange(hsv, (165, 60, 60), (179, 255, 255))
+            mask = cv2.bitwise_or(mask1, mask2)
+
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         bottle_found = False
+        best_contour = None
 
-        # ============================================================
-        # SHAPE VALIDATION (Aspect Ratio & Minimum Area)
-        # ============================================================
-        valid_contours = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 300:  # Ignore tiny pink specks
-                continue
-
-            x_b, y_b, w_b, h_b = cv2.boundingRect(c)
-            if w_b == 0: continue
-
-            aspect_ratio = float(h_b) / float(w_b)
-
-            # A bottle is taller than it is wide.
-            # 1.2 means 20% taller. 4.0 means 4 times taller.
-            if 1.2 <= aspect_ratio <= 4.0:
-                valid_contours.append(c)
+        if contours:
+            if not self.ENABLE_VALIDATION:
+                # ============================================================
+                # VALIDATION OFF — just take the largest pink blob, no questions asked
+                # ============================================================
+                c = max(contours, key=cv2.contourArea)
+                if cv2.contourArea(c) >= 50:
+                    best_contour = c
+                    cv2.putText(debug_img, 'VALIDATION OFF', (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
             else:
-                # Draw rejected objects in RED so you know WHY they were ignored
-                cv2.rectangle(debug_img, (x_b, y_b), (x_b + w_b, y_b + h_b), (0, 0, 255), 2)
-                cv2.putText(debug_img, f'REJECTED (Ratio: {aspect_ratio:.1f})', (x_b, y_b - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        # ============================================================
+                # ============================================================
+                # VALIDATION ON — aspect ratio + distance-adaptive thresholds
+                # ============================================================
+                valid_contours = []
+                for c in contours:
+                    area = cv2.contourArea(c)
+                    if area < 150:
+                        continue
 
-        if valid_contours:
-            # Pick the largest VALID contour
-            c = max(valid_contours, key=cv2.contourArea)
+                    x_b, y_b, w_b, h_b = cv2.boundingRect(c)
+                    if w_b == 0:
+                        continue
 
-            M = cv2.moments(c)
+                    aspect_ratio = float(h_b) / float(w_b)
+
+                    # Get rough depth to relax constraints at distance
+                    if self.depth_img is not None:
+                        try:
+                            dh, dw = self.depth_img.shape[:2]
+                            bcy = min(y_b + h_b // 2, dh - 1)
+                            bcx = min(x_b + w_b // 2, dw - 1)
+                            rough_z = float(self.depth_img[bcy, bcx])
+                        except Exception:
+                            rough_z = 0.0
+                    else:
+                        rough_z = 0.0
+
+                    # Distance-adaptive thresholds
+                    if rough_z > 3000 or rough_z <= 0:   # >3m or no depth
+                        min_ratio, max_ratio = 0.4, 8.0
+                    elif rough_z > 1500:                  # 1.5-3m
+                        min_ratio, max_ratio = 0.8, 6.0
+                    else:                                 # <1.5m
+                        min_ratio, max_ratio = 0.8, 6.0
+
+                    if min_ratio <= aspect_ratio <= max_ratio:
+                        valid_contours.append(c)
+                    else:
+                        cv2.rectangle(debug_img, (x_b, y_b), (x_b + w_b, y_b + h_b), (0, 0, 255), 2)
+                        cv2.putText(debug_img, f'REJECTED (ratio={aspect_ratio:.1f})',
+                                    (x_b, y_b - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+                if valid_contours:
+                    best_contour = max(valid_contours, key=cv2.contourArea)
+
+        # ── Publish result ──
+        if best_contour is not None:
+            M = cv2.moments(best_contour)
             if M['m00'] > 0:
                 u = int(M['m10'] / M['m00'])
                 v = int(M['m01'] / M['m00'])
 
-                cv2.drawContours(debug_img, [c], -1, (255, 0, 255), 2)
-                x_b, y_b, w_b, h_b = cv2.boundingRect(c)
+                cv2.drawContours(debug_img, [best_contour], -1, (255, 0, 255), 2)
+                x_b, y_b, w_b, h_b = cv2.boundingRect(best_contour)
                 cv2.rectangle(debug_img, (x_b, y_b), (x_b + w_b, y_b + h_b), (255, 0, 255), 2)
                 cv2.circle(debug_img, (u, v), 5, (0, 255, 0), -1)
 
@@ -141,7 +210,6 @@ class BottleTracker(Node):
                             cv2.putText(debug_img, f'Pink Bottle ({z:.2f}m)', (x_b, y_b - 25),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
-                            # TF Broadcast
                             t = TransformStamped()
                             t.header.stamp = self.get_clock().now().to_msg()
                             t.header.frame_id = 'zed_camera_center'
@@ -152,7 +220,6 @@ class BottleTracker(Node):
                             t.transform.rotation.w = 1.0
                             self.tf_broadcaster.sendTransform(t)
 
-                            # RViz Marker
                             marker = Marker()
                             marker.header.frame_id = 'zed_camera_center'
                             marker.header.stamp = self.get_clock().now().to_msg()

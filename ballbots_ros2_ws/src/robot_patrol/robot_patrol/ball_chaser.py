@@ -45,14 +45,25 @@ class BallChaser(Node):
         # =====================================================
         # MISSION TUNING
         # =====================================================
-        self.COURT_TURN_DEG        = 50.0   # degrees LEFT from bottle-facing to face court
-        self.RETURN_TURN_DEG = 60.0  # degrees to turn after drop to face court
+        self.COURT_TURN_DEG        = 40.0   # degrees LEFT at startup to face court
+        self.RETURN_TURN_DEG       = 60.0   # degrees to turn after drop (USE_POLE_DETECTION=False)
 
-        self.BALL_STILL_SECS       = 3.0    # seconds ball must be stationary before chasing
-        self.BALL_STILL_THRESHOLD_X  = 0.1   # metres — max spread to count as "still"
-        self.BALL_STILL_THRESHOLD_Z  = 0.4   # metres — max spread to count as "still"
-        self.DROP_EXCLUSION_RADIUS = 0.2    # metres — ignore balls this close to drop point
-        self.BOTTLE_TURN_TIMEOUT   = 370.0  # degrees — give up turn after ~360°
+        self.BALL_STILL_SECS         = 3.0
+        self.BALL_STILL_THRESHOLD_X  = 0.1
+        self.BALL_STILL_THRESHOLD_Z  = 0.4
+        self.DROP_EXCLUSION_RADIUS   = 0.2
+        self.BOTTLE_TURN_TIMEOUT     = 370.0
+
+        # =====================================================
+        # COURT POLE DETECTION TOGGLE
+        # ── True  = rotate left until pole seen, then nudge right POLE_ALIGN_DEG
+        # ── False = rotate fixed RETURN_TURN_DEG (hardcoded, good for testing)
+        # =====================================================
+        self.USE_POLE_DETECTION = True
+
+        self.POLE_CONFIRM_NEEDED = 5      # consecutive frames before trusting pole
+        self.POLE_ALIGN_DEG      = 0.0   # degrees to nudge RIGHT after seeing pole
+                                           # tune so robot ends up facing the court
 
         # =====================================================
         # PUBLISHERS & SUBSCRIBERS
@@ -65,6 +76,7 @@ class BallChaser(Node):
         self.sub_ball_rs  = self.create_subscription(Point,    '/tennis_ball_position_close', self.rs_callback,     10)
         self.sub_bottle   = self.create_subscription(Point,    '/bottle_position',            self.bottle_callback, 10)
         self.sub_odom     = self.create_subscription(Odometry, '/zed/zed_node/odom',          self.odom_callback,   10)
+        self.sub_pole     = self.create_subscription(Point,    '/court_pole_position',        self.pole_callback,   10)
 
         self.srv_start = self.create_service(SetBool, '/start_chasing', self.handle_start)
 
@@ -76,18 +88,23 @@ class BallChaser(Node):
         # =====================================================
         # Flow:
         #  IDLE
-        #  → INIT_SCAN_BOTTLE    : wait 2s, try to lock bottle TF
-        #  → INIT_TURN_TO_COURT  : rotate COURT_TURN_DEG left
-        #  → WAITING_FOR_BALL    : static wait until ball still for 3s
-        #  → CHASING_ZED         : drive toward ball (far)
-        #  → CHASING_RS          : drive toward ball (close, optional)
-        #  → GRABBING            : arm/claw grab sequence
-        #  → TURNING_TO_BOTTLE   : rotate to known bottle angle
-        #  → SEARCHING_BOTTLE    : slow sweep scan for bottle
-        #  → CHASING_BOTTLE      : drive toward bottle
-        #  → DROPPING            : arm/claw drop sequence
-        #  → TURNING_TO_COURT    : rotate back to court_yaw
-        #  → WAITING_FOR_BALL    : repeat
+        #  → INIT_SCAN_BOTTLE       : wait 2s, try to lock bottle TF
+        #  → INIT_TURN_TO_COURT     : rotate COURT_TURN_DEG left
+        #  → WAITING_FOR_BALL       : static wait until ball still for 3s
+        #  → CHASING_ZED            : drive toward ball (far)
+        #  → CHASING_RS             : drive toward ball (close, optional)
+        #  → GRABBING               : arm/claw grab sequence
+        #  → TURNING_TO_BOTTLE      : rotate to known bottle angle
+        #  → SEARCHING_BOTTLE       : slow sweep scan for bottle
+        #  → CHASING_BOTTLE         : drive toward bottle
+        #  → DROPPING               : arm/claw drop sequence
+        #
+        #  [USE_POLE_DETECTION=True]
+        #  → SEARCHING_COURT_POLE   : rotate left until pole seen
+        #  → ALIGNING_TO_COURT      : nudge right POLE_ALIGN_DEG, then WAITING_FOR_BALL
+        #
+        #  [USE_POLE_DETECTION=False]
+        #  → TURNING_TO_COURT       : rotate fixed RETURN_TURN_DEG, then WAITING_FOR_BALL
         # =====================================================
         self.is_active   = False
         self.state       = 'IDLE'
@@ -101,13 +118,14 @@ class BallChaser(Node):
         self.current_yaw = 0.0
 
         # Yaw targets
-        self.court_yaw            = None   # home_yaw + COURT_TURN_DEG
-        self.bottle_yaw_locked    = None   # absolute yaw toward bottle at startup
-        self._bottle_target_angle = 0.0    # used during TURNING_TO_BOTTLE
-        self._turn_start_yaw      = None   # for 360° timeout
+        self.court_yaw            = None
+        self.bottle_yaw_locked    = None
+        self._bottle_target_angle = 0.0
+        self._turn_start_yaw      = None
+        self._turn_settle_since   = None
 
         # Ball stillness
-        self._ball_history     = deque(maxlen=90)   # (timestamp_s, x, z)
+        self._ball_history     = deque(maxlen=90)
         self._ball_still_since = None
 
         # Drop zone
@@ -116,6 +134,10 @@ class BallChaser(Node):
         # Bottle confirmation
         self._bottle_confirm_count = 0
         self.BOTTLE_CONFIRM_NEEDED = 3
+
+        # Pole
+        self._pole_confirm_count = 0
+        self._pole_align_yaw     = None
 
         # Search spin
         self._search_spinning = False
@@ -142,6 +164,10 @@ class BallChaser(Node):
         self.create_timer(0.1, self._bottle_confirm_reset_cb)
 
         self.get_logger().info("Full Mission Ball Chaser node started!")
+        self.get_logger().info(
+            f"  USE_POLE_DETECTION={self.USE_POLE_DETECTION}  "
+            f"POLE_ALIGN_DEG={self.POLE_ALIGN_DEG}°  "
+            f"RETURN_TURN_DEG={self.RETURN_TURN_DEG}°")
 
     # =====================================================
     # ODOMETRY
@@ -173,7 +199,6 @@ class BallChaser(Node):
         if self.is_active:
             self.publish_arm_angle(self.ARM_HORIZONTAL)
             self.publish_claw(self.CLAW_OPEN)
-            # Reset everything for fresh start
             self.home_x = self.home_y = self.home_yaw = None
             self.court_yaw = self.bottle_yaw_locked = None
             self._drop_position = None
@@ -181,9 +206,12 @@ class BallChaser(Node):
             self._ball_still_since = None
             self.grab_confirm_count = 0
             self._bottle_confirm_count = 0
+            self._pole_confirm_count = 0
+            self._pole_align_yaw = None
             self._init_scan_done = False
             self._search_spinning = False
             self.current_vx = 0.0
+            self._turn_settle_since = None
             self.state = 'INIT_SCAN_BOTTLE'
             self.get_logger().info("🚀 MISSION STARTED — scanning for bottle TF...")
         else:
@@ -198,8 +226,6 @@ class BallChaser(Node):
     # CONTROL LOOP (20 Hz)
     # =====================================================
     def control_loop(self):
-        # self.get_logger().info(f"State: {self.state}")
-
         if not self.is_active:
             return
 
@@ -210,39 +236,53 @@ class BallChaser(Node):
             if not self._init_scan_done and self._init_scan_timer is None:
                 self.get_logger().info("🔍 Waiting 2s for bottle TF...")
                 self._init_scan_timer = self.create_timer(2.0, self._init_scan_done_cb)
-            # Robot stays still
 
-        # ─── INIT: turn 90° left to face court ──────────────────────
+        # ─── INIT: turn left to face court ──────────────────────────
         elif self.state == 'INIT_TURN_TO_COURT':
-            if self.court_yaw is None and self.home_yaw is not None:
-                self.court_yaw = self._wrap(self.home_yaw + math.radians(self.COURT_TURN_DEG))
-                self._turn_start_yaw = self.current_yaw  # record where we started
-                self.get_logger().info(
-                    f"🔄 Turning {self.COURT_TURN_DEG}° left → court_yaw={math.degrees(self.court_yaw):.1f}°"
-                )
 
-            if self.court_yaw is None:
-                return
+            if self.USE_POLE_DETECTION:
+                # Rotate left until pole seen — pole_callback handles transition
+                # but we need a different target state: WAITING_FOR_BALL via ALIGNING_TO_COURT
+                if not hasattr(self, '_init_pole_search_started') or not self._init_pole_search_started:
+                    self._init_pole_search_started = True
+                    self._pole_confirm_count = 0
+                    self._pole_align_yaw = None
+                    self._turn_settle_since = None
+                    # Temporarily redirect pole detection to init flow
+                    self._pole_target_state = 'INIT_ALIGN'
+                    self.get_logger().info("🔍 Searching for court pole to face court (init)...")
 
-            # Use final angle target — standard shortest-path diff
-            diff = self._adiff(self.court_yaw, self.current_yaw)
-
-            if abs(diff) < 0.08:
-                self.stop_robot()
-                self._turn_start_yaw = None
-                self.state = 'WAITING_FOR_BALL'
-                self.get_logger().info("✅ Facing court — waiting for still ball...")
-            else:
-                # Always spin CCW (positive), but scale down as we approach target
-                speed = max(0.15, min(0.6, abs(diff) * 1.2))
-                cmd.angular.z = speed  # always CCW
+                cmd.angular.z = 0.1  # CCW = left
                 self.pub_cmd.publish(cmd)
 
-        # ─── WAIT: robot is still, watching for a stationary ball ───
-        elif self.state == 'WAITING_FOR_BALL':
-            self.stop_robot()  # do not move — detection in zed_callback
+            else:
+                # Hardcoded fixed angle turn
+                if self.court_yaw is None and self.home_yaw is not None:
+                    self.court_yaw = self._wrap(self.home_yaw + math.radians(self.COURT_TURN_DEG))
+                    self._turn_start_yaw = self.current_yaw
+                    self.get_logger().info(
+                        f"🔄 Turning {self.COURT_TURN_DEG}° left → court_yaw={math.degrees(self.court_yaw):.1f}°"
+                    )
 
-        # ─── SEARCHING (fallback only — shouldn't normally be used) ─
+                if self.court_yaw is None:
+                    return
+
+                diff = self._adiff(self.court_yaw, self.current_yaw)
+                if abs(diff) < 0.08:
+                    self.stop_robot()
+                    self._turn_start_yaw = None
+                    self.state = 'WAITING_FOR_BALL'
+                    self.get_logger().info("✅ Facing court — waiting for still ball...")
+                else:
+                    speed = max(0.15, min(0.6, abs(diff) * 1.2))
+                    cmd.angular.z = speed
+                    self.pub_cmd.publish(cmd)
+
+        # ─── WAIT: watching for a stationary ball ───────────────────
+        elif self.state == 'WAITING_FOR_BALL':
+            self.stop_robot()
+
+        # ─── SEARCHING (fallback) ────────────────────────────────────
         elif self.state == 'SEARCHING':
             if not self._search_spinning:
                 cmd.angular.z = 0.3
@@ -270,10 +310,10 @@ class BallChaser(Node):
                 self.get_logger().info("🎯 Facing bottle direction — confirming visually...")
             else:
                 speed = max(0.15, min(0.6, abs(diff) * 1.2))
-                cmd.angular.z = speed  # always CCW
+                cmd.angular.z = speed
                 self.pub_cmd.publish(cmd)
 
-        # ─── SEARCHING BOTTLE: stop-and-look sweep ──────────────────
+        # ─── SEARCHING BOTTLE ────────────────────────────────────────
         elif self.state == 'SEARCHING_BOTTLE':
             if not self._search_spinning:
                 cmd.angular.z = 0.35
@@ -281,7 +321,44 @@ class BallChaser(Node):
                 self._search_spinning = True
                 self._search_timer = self.create_timer(0.5, self._search_pause_cb)
 
-        # ─── TURNING BACK TO COURT after drop ───────────────────────
+        # ─── SEARCHING COURT POLE: rotate left until pole seen ───────
+        elif self.state == 'SEARCHING_COURT_POLE':
+            # pole_callback() handles state transition — just keep rotating left
+            cmd.angular.z = 0.3   # CCW = left
+            self.pub_cmd.publish(cmd)
+
+        # ─── ALIGNING TO COURT: nudge right after pole seen ──────────
+        elif self.state == 'ALIGNING_TO_COURT':
+            if self._pole_align_yaw is None:
+                # Turn right (CW) by POLE_ALIGN_DEG from where we saw the pole
+                self._pole_align_yaw = self._wrap(
+                    self.current_yaw - math.radians(self.POLE_ALIGN_DEG))
+                self.get_logger().info(
+                    f"🎾 Nudging right {self.POLE_ALIGN_DEG}° → "
+                    f"target={math.degrees(self._pole_align_yaw):.1f}°")
+
+            diff = self._adiff(self._pole_align_yaw, self.current_yaw)
+            if abs(diff) < 0.08:
+                if self._turn_settle_since is None:
+                    self._turn_settle_since = self.get_clock().now().nanoseconds / 1e9
+                elif (self.get_clock().now().nanoseconds / 1e9 - self._turn_settle_since) > 0.4:
+                    self.stop_robot()
+                    self._turn_settle_since  = None
+                    self._pole_align_yaw     = None
+                    self._pole_confirm_count = 0
+                    self._ball_history.clear()
+                    self._ball_still_since = None
+                    self.state = 'WAITING_FOR_BALL'
+                    self.get_logger().info("✅ Aligned to court — waiting for next ball...")
+                self.stop_robot()
+            else:
+                self._turn_settle_since = None
+                # Negative = CW = right
+                speed = max(0.12, min(0.5, abs(diff) * 1.2))
+                cmd.angular.z = -speed
+                self.pub_cmd.publish(cmd)
+
+        # ─── TURNING BACK TO COURT (hardcoded, USE_POLE_DETECTION=False) ─
         elif self.state == 'TURNING_TO_COURT':
             if self.court_yaw is None:
                 self.state = 'WAITING_FOR_BALL'
@@ -289,20 +366,19 @@ class BallChaser(Node):
 
             diff = self._adiff(self.court_yaw, self.current_yaw)
             if abs(diff) < 0.15:
-                # Hold check — must stay settled for 0.5s before transitioning
                 if self._turn_settle_since is None:
                     self._turn_settle_since = self.get_clock().now().nanoseconds / 1e9
                 elif (self.get_clock().now().nanoseconds / 1e9 - self._turn_settle_since) > 0.5:
                     self.stop_robot()
                     self._turn_settle_since = None
-                    self._turn_start_yaw = None
+                    self._turn_start_yaw    = None
                     self._ball_history.clear()
                     self._ball_still_since = None
                     self.state = 'WAITING_FOR_BALL'
                     self.get_logger().info("✅ Facing court again — waiting for next ball...")
                 self.stop_robot()
             else:
-                self._turn_settle_since = None  # reset if it drifts out
+                self._turn_settle_since = None
                 cmd.angular.z = max(-0.6, min(0.6, 1.5 * diff))
                 self.pub_cmd.publish(cmd)
 
@@ -335,19 +411,40 @@ class BallChaser(Node):
         self.state = 'INIT_TURN_TO_COURT'
 
     # =====================================================
+    # POLE CALLBACK
+    # =====================================================
+    def pole_callback(self, msg):
+        if not self.is_active: return
+
+        # Handle both init and post-drop pole search
+        valid_states = ('SEARCHING_COURT_POLE', 'INIT_TURN_TO_COURT')
+        if self.state not in valid_states: return
+        if not self.USE_POLE_DETECTION: return
+
+        self._pole_confirm_count += 1
+        self.get_logger().info(
+            f"🎾 Court pole seen ({self._pole_confirm_count}/{self.POLE_CONFIRM_NEEDED})")
+
+        if self._pole_confirm_count >= self.POLE_CONFIRM_NEEDED:
+            self.stop_robot()
+            self._pole_align_yaw = None
+            self._turn_settle_since = None
+            self._init_pole_search_started = False  # reset for next time
+            self.state = 'ALIGNING_TO_COURT'
+            self.get_logger().info("🎾 Pole confirmed! Nudging right to face court...")
+
+    # =====================================================
     # ZED CALLBACK (ball tracking + chasing)
     # =====================================================
     def zed_callback(self, msg):
         if not self.is_active: return
 
-        # In waiting states — check stillness but don't chase yet
         if self.state in ('WAITING_FOR_BALL',):
             self._track_ball_stillness(msg)
             return
 
         if self.state != 'CHASING_ZED': return
 
-        # Handoff to RealSense
         if msg.z < self.tilt_start_dist:
             self.get_logger().info(f"Handoff to RealSense at {msg.z:.2f}m")
             self.state = 'CHASING_RS'
@@ -356,7 +453,6 @@ class BallChaser(Node):
             self.grab_confirm_count = 0
             return
 
-        # Grab trigger
         if msg.z <= self.grab_dist and abs(msg.x) < 0.06:
             self.grab_confirm_count += 1
             if self.grab_confirm_count >= self.GRAB_CONFIRM_NEEDED:
@@ -365,7 +461,6 @@ class BallChaser(Node):
                 self.stop_robot()
             return
 
-        # Drive toward ball
         target_vx = 0.0
         target_wz  = 0.0
         if not self.is_aligned:
@@ -420,10 +515,11 @@ class BallChaser(Node):
     # BALL STILLNESS DETECTION
     # =====================================================
     def _track_ball_stillness(self, msg):
-        # Ignore balls that are physically near the drop zone
-        # Use ball's world position estimate instead of robot position
+        # Ignore very close detections — likely dropped ball or noise
+        if msg.z < 1.0:
+            return
+
         if self._drop_position is not None:
-            # Estimate ball world position using robot pos + ball camera offset
             ball_world_x = self.current_x + msg.z * math.cos(self.current_yaw) \
                            - msg.x * math.sin(self.current_yaw)
             ball_world_y = self.current_y + msg.z * math.sin(self.current_yaw) \
@@ -439,7 +535,6 @@ class BallChaser(Node):
         if len(self._ball_history) < 5:
             return
 
-        # Only look at samples within the window
         recent = [(t, x, z) for t, x, z in self._ball_history
                   if now - t <= self.BALL_STILL_SECS]
 
@@ -449,25 +544,22 @@ class BallChaser(Node):
 
         xs = [x for _, x, _ in recent]
         zs = [z for _, _, z in recent]
-
-        # x (lateral) is precise — z (depth) is noisy at range, use loose threshold
         x_spread = max(xs) - min(xs)
         z_spread = max(zs) - min(zs)
-        x_still = x_spread < self.BALL_STILL_THRESHOLD_X
-        z_still = z_spread < self.BALL_STILL_THRESHOLD_Z  # RealSense depth noise at 3m+ can be ±0.2m
+        x_still  = x_spread < self.BALL_STILL_THRESHOLD_X
+        z_still  = z_spread < self.BALL_STILL_THRESHOLD_Z
 
         if x_still and z_still:
             if self._ball_still_since is None:
                 self._ball_still_since = now
                 self.get_logger().info(
-                    f"⏳ Ball looks still (x_spread={x_spread:.3f}m z_spread={z_spread:.3f}m) — "
+                    f"⏳ Ball looks still (x={x_spread:.3f}m z={z_spread:.3f}m) — "
                     f"waiting {self.BALL_STILL_SECS}s...",
                     throttle_duration_sec=1.0
                 )
             elapsed = now - self._ball_still_since
             if elapsed >= self.BALL_STILL_SECS:
-                self.get_logger().info(
-                    f"🎾 Ball still for {self.BALL_STILL_SECS}s — CHASING!")
+                self.get_logger().info(f"🎾 Ball still for {self.BALL_STILL_SECS}s — CHASING!")
                 self.stop_robot()
                 self.state = 'CHASING_ZED'
                 self.is_aligned = False
@@ -505,32 +597,27 @@ class BallChaser(Node):
 
         if self.state != 'CHASING_BOTTLE': return
 
-        if self.state != 'CHASING_BOTTLE': return
-
         drop_dist = 0.6
 
         if msg.z <= drop_dist and abs(msg.x) < 0.15:
             self.execute_drop()
             return
 
-        err_dist = msg.z - drop_dist
+        err_dist  = msg.z - drop_dist
         target_vx = max(0.0, min(0.25, 0.4 * err_dist))
         target_wz = max(-0.20, min(0.20, -0.3 * msg.x))
 
-        # Only steer-only for very large offsets, otherwise drive and steer together
         if abs(msg.x) > 0.50:
             target_vx = 0.0
 
-        # Apply same acceleration ramp as ball chase
         self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
-
         cmd = Twist()
         cmd.linear.x = self.current_vx
         cmd.angular.z = target_wz
         self.pub_cmd.publish(cmd)
 
     def _bottle_confirm_reset_cb(self):
-        pass  # decay disabled
+        pass
 
     # =====================================================
     # SEARCH SPIN HELPERS
@@ -595,14 +682,14 @@ class BallChaser(Node):
                     self.get_logger().info("✅ Grab complete — turning to bottle...")
                     self._begin_turn_to_bottle()
                 else:
-                    self.get_logger().info("✅ Drop complete — turning back to court...")
+                    self.get_logger().info("✅ Drop complete — returning to court...")
                     self._drop_position = (self.current_x, self.current_y)
                     self._begin_turn_to_court()
         else:
             self.publish_arm_angle(self.arm_angle)
 
     def _begin_turn_to_bottle(self):
-        """After grab — compute best angle to bottle and begin turning"""
+        """After grab — compute best angle to bottle and begin turning."""
         try:
             tf = self.tf_buffer.lookup_transform(
                 'base_link', 'neon_bottle',
@@ -613,25 +700,37 @@ class BallChaser(Node):
             bz = tf.transform.translation.z
             angle = math.atan2(bx, bz)
             self._bottle_target_angle = self._wrap(self.current_yaw + angle)
-            self.get_logger().info(
-                f"🧴 Fresh bottle TF: turning {math.degrees(angle):.1f}°")
+            self.get_logger().info(f"🧴 Fresh bottle TF: turning {math.degrees(angle):.1f}°")
             self._turn_start_yaw = None
             self.state = 'TURNING_TO_BOTTLE'
         except Exception as e:
-            # TF failed — don't use stale startup yaw, just sweep visually
             self.get_logger().warn(f"⚠️  Bottle TF failed ({e}) — sweeping...")
             self._search_spinning = False
-            self._turn_start_yaw = None
+            self._turn_start_yaw  = None
             self.state = 'SEARCHING_BOTTLE'
 
     def _begin_turn_to_court(self):
-        """After drop — turn fixed degrees from current heading back to face the court"""
-        self.court_yaw = self._wrap(self.current_yaw + math.radians(self.RETURN_TURN_DEG))
-        self._turn_settle_since = None
-        self._turn_start_yaw = None
-        self.state = 'TURNING_TO_COURT'
-        self.get_logger().info(
-            f"↩️ Turning {self.RETURN_TURN_DEG}° from current → court yaw={math.degrees(self.court_yaw):.1f}°...")
+        """After drop — return to face the court.
+
+        USE_POLE_DETECTION = True  → rotate left until the court pole is seen,
+                                     then nudge right POLE_ALIGN_DEG degrees.
+        USE_POLE_DETECTION = False → rotate a fixed RETURN_TURN_DEG (for testing).
+        """
+        if self.USE_POLE_DETECTION:
+            self._pole_confirm_count = 0
+            self._pole_align_yaw    = None
+            self._turn_settle_since = None
+            self.state = 'SEARCHING_COURT_POLE'
+            self.get_logger().info("🔍 Searching for court pole (rotating left)...")
+        else:
+            self.court_yaw = self._wrap(
+                self.current_yaw + math.radians(self.RETURN_TURN_DEG))
+            self._turn_settle_since = None
+            self._turn_start_yaw    = None
+            self.state = 'TURNING_TO_COURT'
+            self.get_logger().info(
+                f"↩️ Turning {self.RETURN_TURN_DEG}° from current → "
+                f"court yaw={math.degrees(self.court_yaw):.1f}°...")
 
     def _close_claw_cb(self):
         self._action_timer.cancel()

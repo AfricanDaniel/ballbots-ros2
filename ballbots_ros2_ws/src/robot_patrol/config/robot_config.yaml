@@ -18,6 +18,6 @@
     claw_closed_deg: 175.0
 
     # --- Tracking Behavior ---
-    target_dist: 0.2
+    target_dist: 0.1
     grab_dist: 0.16
-    tilt_start_dist: 0.6
+    tilt_start_dist: 0.01

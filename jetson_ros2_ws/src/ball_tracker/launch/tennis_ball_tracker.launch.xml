@@ -35,14 +35,14 @@
   <!-- ============================= -->
   <!-- Tennis Ball Tracker Node -->
   <!-- ============================= -->
-  <node
-    pkg="ball_tracker"
-    exec="tennis_ball_tracker"
-    name="tennis_ball_tracker"
-    output="screen"
-  >
-    <param name="debug_logs" value="$(var debug_logs)"/>
-  </node>
+<!--  <node-->
+<!--    pkg="ball_tracker"-->
+<!--    exec="tennis_ball_tracker"-->
+<!--    name="tennis_ball_tracker"-->
+<!--    output="screen"-->
+<!--  >-->
+<!--    <param name="debug_logs" value="$(var debug_logs)"/>-->
+<!--  </node>-->
 
   <node
     pkg="ball_tracker"
@@ -51,6 +51,7 @@
     output="screen"
   >
     <param name="debug_logs" value="$(var debug_logs)"/>
+    <remap from="/tennis_ball_position_close" to="/tennis_ball_position"/>
   </node>
 
     <node

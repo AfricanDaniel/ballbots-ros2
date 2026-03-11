@@ -35,14 +35,26 @@ class BottleTracker(Node):
         # self.POLE_V_LOW = 80
         # self.POLE_V_HIGH = 255
         # self.POLE_MIN_AREA = 300  # bottle is bigger than a thin pole
-        self.POLE_H_LOW = 5  # orange hue
-        self.POLE_H_HIGH = 20
-        self.POLE_S_LOW = 150  # orange is very saturated
+        # ============================================================
+        # self.POLE_H_LOW = 5  # orange hue
+        # self.POLE_H_HIGH = 20
+        # self.POLE_S_LOW = 150  # orange is very saturated
+        # self.POLE_S_HIGH = 255
+        # self.POLE_V_LOW = 100  # bright
+        # self.POLE_V_HIGH = 255
+        # self.POLE_MIN_AREA = 300
+        # self.POLE_ASPECT_RATIO = 0.5  # bottle is roughly as tall as wide, relax this
+        # ============================================================
+        self.POLE_H_LOW = 0  # red lower range
+        self.POLE_H_HIGH = 10
+        self.POLE_H_LOW2 = 165  # red upper range (wraps around 180)
+        self.POLE_H_HIGH2 = 179
+        self.POLE_S_LOW = 120  # saturated red
         self.POLE_S_HIGH = 255
-        self.POLE_V_LOW = 100  # bright
+        self.POLE_V_LOW = 80  # not too dark
         self.POLE_V_HIGH = 255
-        self.POLE_MIN_AREA = 300
-        self.POLE_ASPECT_RATIO = 0.5  # bottle is roughly as tall as wide, relax this
+        self.POLE_MIN_AREA = 200  # cylinder visible from far
+        self.POLE_ASPECT_RATIO = 1.5  # tall narrow — back to pole shape
         self.POLE_CONFIRM_FRAMES = 3     # consecutive frames before publishing
         # ============================================================
 
@@ -120,7 +132,7 @@ class BottleTracker(Node):
         if self.YELLOW_MODE:
             mask = cv2.inRange(hsv, (20,  80,  80), (35,  255, 255))
         elif self.BLUE_MODE:
-            mask = cv2.inRange(hsv, (100, 80,  80), (130, 255, 255))
+            mask = cv2.inRange(hsv, (100, 80, 80), (130, 255, 255))
         elif self.SALMON_MODE:
             mask = cv2.bitwise_or(
                 cv2.inRange(hsv, (0,   30, 60), (20,  255, 255)),
@@ -134,7 +146,27 @@ class BottleTracker(Node):
                 cv2.inRange(hsv, (0,   60, 60), (15,  255, 255)),
                 cv2.inRange(hsv, (165, 60, 60), (179, 255, 255)))
 
-        # ── Bottle detection ──────────────────────────────────────────
+        # Stats for debug overlay
+        total_pixels = h * w
+        match_count  = cv2.countNonZero(mask)
+        hsv_pct      = (match_count / total_pixels) * 100.0
+
+        # Center depth stats
+        if self.depth_img is not None:
+            dh, dw   = self.depth_img.shape[:2]
+            cdx, cdy = dw // 2, dh // 2
+            margin   = 80
+            center_depth = self.depth_img[
+                max(0, cdy - margin):min(dh, cdy + margin),
+                max(0, cdx - margin):min(dw, cdx + margin)
+            ]
+            total_d   = center_depth.size
+            invalid_d = int(np.sum((center_depth == 0) | np.isnan(center_depth)))
+            nan_pct   = (invalid_d / total_d) * 100.0
+        else:
+            nan_pct = 0.0
+
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         bottle_found  = False
         best_contour  = None
@@ -150,7 +182,7 @@ class BottleTracker(Node):
                 valid_contours = []
                 for c in contours:
                     area = cv2.contourArea(c)
-                    if area < 150: continue
+                    if area < 50: continue
                     x_b, y_b, w_b, h_b = cv2.boundingRect(c)
                     if w_b == 0: continue
                     aspect_ratio = float(h_b) / float(w_b)
@@ -166,11 +198,11 @@ class BottleTracker(Node):
                             pass
 
                     if rough_z > 3000 or rough_z <= 0:
-                        min_r, max_r = 0.4, 8.0
+                        min_r, max_r = 0.3, 10.0  # far/unknown — very relaxed
                     elif rough_z > 1500:
-                        min_r, max_r = 0.8, 6.0
+                        min_r, max_r = 0.4, 8.0   # 1.5–3m
                     else:
-                        min_r, max_r = 0.8, 6.0
+                        min_r, max_r = 0.5, 6.0   # <1.5m — tighter
 
                     if min_r <= aspect_ratio <= max_r:
                         valid_contours.append(c)
@@ -246,9 +278,32 @@ class BottleTracker(Node):
                     except Exception:
                         pass
 
-        if not bottle_found:
-            cv2.putText(debug_img, 'Searching for Bottle...', (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
+        # ── Rich stats overlay (matches realsense tracker style) ──────
+        if best_contour is not None:
+            _area  = cv2.contourArea(best_contour)
+            _perim = cv2.arcLength(best_contour, True)
+            _circ  = (4 * np.pi * _area / (_perim * _perim)) if _perim > 0 else 0.0
+            x_b2, y_b2, w_b2, h_b2 = cv2.boundingRect(best_contour)
+            _ar = float(h_b2) / float(w_b2) if w_b2 > 0 else 0.0
+        else:
+            _area = _circ = _ar = 0.0
+            w_b2 = h_b2 = 0
+
+        _z_str = f"{z/1000:.2f}m" if bottle_found else "---"
+        status_color = (255, 0, 255) if bottle_found else (0, 165, 255)
+        status_label = f"Bottle {_z_str}" if bottle_found else "Searching for Bottle..."
+        cv2.putText(debug_img, status_label, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
+
+        lines = [
+            f"area={_area:.0f}px  hsv={hsv_pct:.1f}%",
+            f"nan={nan_pct:.0f}%  circ={_circ:.2f}",
+            f"bbox={w_b2}x{h_b2}  ar={_ar:.2f}",
+            f"H:100-130 S:80-255 V:80-255",
+        ]
+        for i, line in enumerate(lines):
+            cv2.putText(debug_img, line, (10, 65 + i * 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         annotated = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
         annotated.header.stamp    = self.get_clock().now().to_msg()
@@ -267,10 +322,13 @@ class BottleTracker(Node):
         h, w = cv_img.shape[:2]
 
         # Dark green mask
-        pole_mask = cv2.inRange(
-            hsv,
-            (self.POLE_H_LOW,  self.POLE_S_LOW,  self.POLE_V_LOW),
-            (self.POLE_H_HIGH, self.POLE_S_HIGH,  self.POLE_V_HIGH)
+        pole_mask = cv2.bitwise_or(
+            cv2.inRange(hsv,
+                        (self.POLE_H_LOW, self.POLE_S_LOW, self.POLE_V_LOW),
+                        (self.POLE_H_HIGH, self.POLE_S_HIGH, self.POLE_V_HIGH)),
+            cv2.inRange(hsv,
+                        (self.POLE_H_LOW2, self.POLE_S_LOW, self.POLE_V_LOW),
+                        (self.POLE_H_HIGH2, self.POLE_S_HIGH, self.POLE_V_HIGH))
         )
 
         # Morphology — fill gaps in pole, remove noise

@@ -24,26 +24,31 @@
   </include>
 
   <!-- ============================= -->
-  <!-- ZED Camera Launch -->
+  <!-- ZED Camera Launch — kept for odometry + bottle_tracker -->
   <!-- ============================= -->
   <include
     file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
     <arg name="camera_model" value="zed2i"/>
-    <arg name="camera_name" value="zed"/>
+    <arg name="camera_name"  value="zed"/>
   </include>
 
   <!-- ============================= -->
-  <!-- Tennis Ball Tracker Node -->
+  <!-- Tennis Ball Tracker — DISABLED, RealSense used instead -->
   <!-- ============================= -->
-<!--  <node-->
-<!--    pkg="ball_tracker"-->
-<!--    exec="tennis_ball_tracker"-->
-<!--    name="tennis_ball_tracker"-->
-<!--    output="screen"-->
-<!--  >-->
-<!--    <param name="debug_logs" value="$(var debug_logs)"/>-->
-<!--  </node>-->
+  <!--
+  <node
+    pkg="ball_tracker"
+    exec="tennis_ball_tracker"
+    name="tennis_ball_tracker"
+    output="screen"
+  >
+    <param name="debug_logs" value="$(var debug_logs)"/>
+  </node>
+  -->
 
+  <!-- ============================= -->
+  <!-- RealSense Tracker — remapped to ZED ball topic -->
+  <!-- ============================= -->
   <node
     pkg="ball_tracker"
     exec="realsense_tracker"
@@ -54,13 +59,15 @@
     <remap from="/tennis_ball_position_close" to="/tennis_ball_position"/>
   </node>
 
-    <node
+  <!-- ============================= -->
+  <!-- Bottle Tracker -->
+  <!-- ============================= -->
+  <node
     pkg="ball_tracker"
     exec="bottle_tracker"
     name="bottle_tracker"
     output="screen">
   </node>
-
 
   <!-- ============================= -->
   <!-- RViz (optional) -->

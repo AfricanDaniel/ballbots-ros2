@@ -1,210 +1,354 @@
 #!/usr/bin/env python3
+"""
+realsense_tracker_yolo.py
+
+Single node replacing:
+  - tennis_ball_tracker.py  (ZED HSV ball)
+  - realsense_tracker.py    (RealSense HSV ball)
+  - bottle_tracker.py       (ZED HSV bottle + pole)
+
+YOLO model classes:
+  0 = tennis ball   → /tennis_ball_position  +  /tennis_ball_position_close
+  1 = water bottle  → /bottle_position  +  TF neon_bottle
+  2 = net strap     → /court_pole_position
+
+All debug images published as CompressedImage for low bandwidth.
+"""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
-from geometry_msgs.msg import Point
-from std_msgs.msg import Bool
+from geometry_msgs.msg import Point, TransformStamped
 from cv_bridge import CvBridge
+import tf2_ros
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import os
 
+# Ultralytics YOLO
+import torch
+from ultralytics import YOLO
+from ament_index_python.packages import get_package_share_directory
 
-class RealSenseYOLOTracker(Node):
+
+class RealSenseTrackerYolo(Node):
+
     def __init__(self):
-        super().__init__('realsense_tracker')
-        self.bridge = CvBridge()
+        super().__init__('realsense_tracker_yolo')
+        model = YOLO('/home/msr/ballbots_ros2_ws/install/ball_tracker/share/ball_tracker/best_train_model.pt')
+        print(model.names)
+
+        # =====================================================
+        # MODEL
+        # =====================================================
+        model_path = os.path.join(
+            get_package_share_directory('ball_tracker'), 'best_train_model.pt')
+
+        self.get_logger().info(f"Loading YOLO model from: {model_path}")
+        device = 'cpu'
+        self.get_logger().info(f"Using device: {device}")
+        self.model = YOLO(model_path)
+        self.model.to(device)
+
+
+        self.CLASS_BALL   = 0
+        self.CLASS_BOTTLE = 1
+        self.CLASS_STRAP  = 2   # net centre strap → replaces court pole
+
+        # =====================================================
+        # TUNING
+        # =====================================================
+        self.CONF_THRESHOLD = 0.1    # minimum detection confidence
+        self.DEPTH_ROI      = 5       # px radius for median depth sample
+        self.GRAB_AREA_PX   = 175000  # px² — fallback z when depth is NaN (very close)
+
+        # =====================================================
+        # CAMERA INTRINSICS
+        # =====================================================
         self.fx = self.fy = self.cx = self.cy = None
+        self.depth_img  = None
+        self.bridge     = CvBridge()
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
-        # -----------------------------------------------------
-        # STATE: Start asleep (ZED handles far range)
-        # -----------------------------------------------------
-        self.is_active = False
-        self.depth_img = None
-
-        # Load YOLO model (Change 'yolov8n.pt' to 'yolov8n.engine' if you exported to TensorRT)
-        self.get_logger().info("Loading YOLOv8n model for RealSense...")
-        os.environ['YOLO_VERBOSE'] = 'False'
-        self.model = YOLO('yolov8n.pt')
-        self.model.to('cpu')
-
-        # Bounding Box Thresholds
-        self.STOP_WIDTH = 180  # Pixels wide when we must STOP and grab
-
-        # Subscribers
-        self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.cam_info_cb, 10)
-        self.create_subscription(Image, '/camera/camera/color/image_raw', self.rgb_cb, 10)
+        # =====================================================
+        # SUBSCRIBERS
+        # =====================================================
+        self.create_subscription(CameraInfo,
+            '/camera/camera/color/camera_info',             self.cam_info_cb, 10)
         self.create_subscription(Image,
-                                 '/camera/camera/aligned_depth_to_color/image_raw',
-                                 self.depth_cb, 10)
+            '/camera/camera/color/image_raw',               self.rgb_cb,      10)
+        self.create_subscription(Image,
+            '/camera/camera/aligned_depth_to_color/image_raw', self.depth_cb, 10)
 
-        # NEW: The Compute Toggle Subscriber
-        self.create_subscription(Bool, '/use_realsense', self.toggle_cb, 10)
+        # =====================================================
+        # PUBLISHERS
+        # =====================================================
+        # Ball — two topics so ball_chaser.py keeps working unchanged
+        self.pub_ball_far   = self.create_publisher(Point, '/tennis_ball_position',       10)
+        self.pub_ball_close = self.create_publisher(Point, '/tennis_ball_position_close', 10)
 
-        # Publishers
-        self.pub = self.create_publisher(Point, '/tennis_ball_position_close', 10)
-        #self.debug_pub = self.create_publisher(CompressedImage, '/realsense/debug_image', 10)
-        self.debug_pub = self.create_publisher(Image, '/realsense/debug_image', 10)
+        # Bottle
+        self.pub_bottle = self.create_publisher(Point, '/bottle_position', 10)
 
-        self.get_logger().info("RealSense YOLO tracker ready (Sleeping).")
+        # Court pole / net strap
+        self.pub_pole = self.create_publisher(Point, '/court_pole_position', 10)
 
-    def toggle_cb(self, msg):
-        """Wakes up or puts the tracker to sleep based on ball_chaser state"""
-        if self.is_active != msg.data:
-            self.is_active = msg.data
-            state_str = "AWAKE" if self.is_active else "SLEEPING"
-            self.get_logger().info(f"RealSense Tracker is now {state_str}")
+        # Debug — one compressed image showing all detections
+        self.pub_debug = self.create_publisher(
+            CompressedImage, '/yolo/debug_image/compressed', 10)
 
-    def cam_info_cb(self, msg):
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("RealSense YOLO Tracker started!")
+        self.get_logger().info(
+            f"  class 0 (ball)   → /tennis_ball_position + /tennis_ball_position_close")
+        self.get_logger().info(
+            f"  class 1 (bottle) → /bottle_position + TF neon_bottle")
+        self.get_logger().info(
+            f"  class 2 (strap)  → /court_pole_position")
+        self.get_logger().info(f"  conf threshold   = {self.CONF_THRESHOLD}")
+        self.get_logger().info("=" * 60)
+
+    # =====================================================
+    # CAMERA INFO
+    # =====================================================
+    def cam_info_cb(self, msg: CameraInfo):
         if self.fx is None:
             self.fx = msg.k[0]
             self.fy = msg.k[4]
             self.cx = msg.k[2]
             self.cy = msg.k[5]
+            self.get_logger().info(
+                f"Intrinsics: fx={self.fx:.1f} fy={self.fy:.1f} "
+                f"cx={self.cx:.1f} cy={self.cy:.1f}")
 
-    def depth_cb(self, msg):
-        if self.is_active:
-            self.depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+    # =====================================================
+    # DEPTH
+    # =====================================================
+    def depth_cb(self, msg: Image):
+        self.depth_img = self.bridge.imgmsg_to_cv2(
+            msg, desired_encoding='passthrough')
 
-    def rgb_cb(self, msg):
-        # COMPUTE SAVER: If ball is far away, do absolutely nothing.
-        if not self.is_active or None in [self.fx, self.fy, self.cx, self.cy]:
+    # =====================================================
+    # RGB → YOLO INFERENCE
+    # =====================================================
+    def rgb_cb(self, msg: Image):
+        if self.fx is None:
+            self.get_logger().info(
+                "Waiting for camera_info...", throttle_duration_sec=2.0)
+            return
+        if self.depth_img is None:
+            self.get_logger().info(
+                "Waiting for depth image...", throttle_duration_sec=2.0)
             return
 
         cv_img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        debug  = cv_img.copy()
 
-        # Run YOLO inference (classes=[32] is 'sports ball')
-        results = self.model.predict(
-            source=cv_img,
-            imgsz=320,
-            classes=[32],
-            conf=0.3,
-            verbose=False,
-            device='cpu'
-        )
+        # Run YOLO
+        results = self.model(cv_img, conf=self.CONF_THRESHOLD, verbose=False, device='cpu')
 
-        if len(results[0].boxes) == 0:
-            # =====================================================
-            # YOLO FALLBACK — closest depth in center region
-            # When YOLO can't detect the ball at close range
-            # (fills too much of frame), use depth to find it.
-            # At this point we know the ball is in front of us
-            # so the closest thing in the center IS the ball.
-            # =====================================================
-            if self.depth_img is not None:
-                h, w = self.depth_img.shape[:2]
-                cx, cy = w // 2, h // 2
-                margin = 100  # 200x200 center region
-                center = self.depth_img[
-                    cy - margin:cy + margin,
-                    cx - margin:cx + margin
-                ].astype(float)
-                valid = center[(center > 0) & np.isfinite(center)]
+        best = {
+            self.CLASS_BALL:   None,   # (conf, box)
+            self.CLASS_BOTTLE: None,
+            self.CLASS_STRAP:  None,
+        }
 
-                if len(valid) > 0:
-                    z_mm = float(np.min(valid))  # closest point in center
-                    if z_mm < 800:               # only trust if within 0.8m
-                        z = z_mm / 1000.0
-                        self.get_logger().info(
-                            f"[FALLBACK] YOLO missed — depth fallback z={z:.3f}m",
-                            throttle_duration_sec=0.5
-                        )
-                        pt = Point()
-                        pt.x = 0.0  # assume centered — ball should be right ahead
-                        pt.y = 0.0
-                        pt.z = z
-                        self.pub.publish(pt)
-                        self._publish_debug_img(cv_img, None, valid=False,
-                                                fallback_z=z)
-                        return
+        # Keep highest-confidence detection per class
+        for result in results:
+            for box in result.boxes:
+                cls  = int(box.cls[0])
+                conf = float(box.conf[0])
+                if cls not in best:
+                    continue
+                if best[cls] is None or conf > best[cls][0]:
+                    best[cls] = (conf, box)
 
-            self._publish_debug_img(cv_img, None, valid=False)
+        # ── Process each class ─────────────────────────────────────────
+        self._handle_ball  (best[self.CLASS_BALL],   cv_img, debug)
+        self._handle_bottle(best[self.CLASS_BOTTLE], cv_img, debug)
+        self._handle_strap (best[self.CLASS_STRAP],  cv_img, debug)
+
+        self._publish_debug(debug)
+
+    # =====================================================
+    # CLASS 0 — TENNIS BALL
+    # =====================================================
+    def _handle_ball(self, detection, cv_img, debug):
+        label = "ball"
+        color = (0, 255, 0)
+
+        if detection is None:
+            cv2.putText(debug, "ball: not seen", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 2)
             return
-            # =====================================================
 
-        # Get highest confidence ball
-        best_box = results[0].boxes[0]
-        x1, y1, x2, y2 = map(int, best_box.xyxy[0].cpu().numpy())
-        conf = float(best_box.conf[0].cpu().numpy())
+        conf, box = detection
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        u = (x1 + x2) // 2
+        v = (y1 + y2) // 2
 
-        # Geometry
-        bbox_width = x2 - x1
-        u = x1 + (bbox_width / 2.0)
-        v = y1 + ((y2 - y1) / 2.0)
+        z = self._depth_at(u, v)
 
-        # Width-to-Depth Logic
-        if bbox_width >= self.STOP_WIDTH:
-            z = 0.15  # Force grab distance — ball is right there
-            self.get_logger().info(
-                f"[YOLO] bbox_width={bbox_width}px >= STOP_WIDTH={self.STOP_WIDTH} "
-                f"— forcing z=0.15m"
-            )
-        else:
-            # Z = (focal_length_x * real_diameter_meters) / pixel_width
-            z = (self.fx * 0.067) / bbox_width
-            self.get_logger().info(
-                f"[YOLO] bbox_width={bbox_width}px conf={conf:.2f} z={z:.3f}m",
-                throttle_duration_sec=0.5
-            )
+        # If depth NaN but bbox is huge → robot is right on top of ball
+        if z is None:
+            bbox_area = (x2 - x1) * (y2 - y1)
+            if bbox_area >= self.GRAB_AREA_PX:
+                z = 0.10
+            else:
+                cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(debug, f"ball: no depth ({conf:.2f})", (x1, y1 - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+                return
 
         x_cam = (u - self.cx) * z / self.fx
         y_cam = (v - self.cy) * z / self.fy
 
-        # Publish target
         pt = Point()
-        pt.x, pt.y, pt.z = float(x_cam), float(y_cam), float(z)
-        self.pub.publish(pt)
+        pt.x = x_cam
+        pt.y = y_cam
+        pt.z = z
 
-        # Publish debug image
-        box_data = (x1, y1, x2, y2, conf, bbox_width, z)
-        self._publish_debug_img(cv_img, box_data, valid=True)
+        # Publish on BOTH topics — ball_chaser.py can use either
+        self.pub_ball_far.publish(pt)
+        self.pub_ball_close.publish(pt)
 
-    def _publish_debug_img(self, cv_img, box_data, valid=True, fallback_z=None):
-        debug_img = cv_img.copy()
+        self.get_logger().info(
+            f"[BALL] z={z:.3f}m x={x_cam:.3f}m conf={conf:.2f}",
+            throttle_duration_sec=0.5)
 
-        if valid and box_data:
-            x1, y1, x2, y2, conf, width, z = box_data
+        cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
+        cv2.circle(debug, (u, v), 5, (0, 0, 255), -1)
+        cv2.putText(debug, f"ball z={z:.2f}m ({conf:.2f})", (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-            # Draw Bounding Box
-            color = (0, 255, 0)  # Green
-            if width >= self.STOP_WIDTH:
-                color = (0, 0, 255)  # Red if in grab zone
+    # =====================================================
+    # CLASS 1 — WATER BOTTLE
+    # =====================================================
+    def _handle_bottle(self, detection, cv_img, debug):
+        color = (255, 0, 255)
 
-            cv2.rectangle(debug_img, (x1, y1), (x2, y2), color, 3)
+        if detection is None:
+            cv2.putText(debug, "bottle: not seen", (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 2)
+            return
 
-            # Draw Center Dot
-            cv2.circle(debug_img, (int(x1 + width / 2), int(y1 + (y2 - y1) / 2)), 5, (255, 0, 0), -1)
+        conf, box = detection
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        u = (x1 + x2) // 2
+        v = (y1 + y2) // 2
 
-            # Draw Text
-            label = f"Ball {conf:.2f} | W:{width}px | Z:{z:.2f}m"
-            cv2.putText(debug_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        elif fallback_z is not None:
-            # Show fallback mode on screen
-            cv2.putText(debug_img, f"FALLBACK depth z={fallback_z:.3f}m",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
-            cv2.putText(debug_img, "YOLO miss — using center depth",
-                        (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        z = self._depth_at(u, v)
+        if z is None:
+            cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(debug, f"bottle: no depth ({conf:.2f})", (x1, y1 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+            return
 
-        else:
-            cv2.putText(debug_img, "Searching...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
+        x_cam = (u - self.cx) * z / self.fx
+        y_cam = (v - self.cy) * z / self.fy
 
-        img_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
-        img_msg.header.stamp = self.get_clock().now().to_msg()
-        self.debug_pub.publish(img_msg)
-        # # Compress and Publish
-        # compressed_msg = CompressedImage()
-        # compressed_msg.header.stamp = self.get_clock().now().to_msg()
-        # compressed_msg.format = "jpeg"
-        # _, buf = cv2.imencode('.jpg', debug_img, [cv2.IMWRITE_JPEG_QUALITY, 50])
-        # compressed_msg.data = buf.tobytes()
-        # self.debug_pub.publish(compressed_msg)
+        pt = Point()
+        pt.x = x_cam
+        pt.y = y_cam
+        pt.z = z
+        self.pub_bottle.publish(pt)
+
+        # Broadcast TF so ball_chaser.py can still look up neon_bottle
+        t = TransformStamped()
+        t.header.stamp    = self.get_clock().now().to_msg()
+        t.header.frame_id = 'camera_color_optical_frame'
+        t.child_frame_id  = 'neon_bottle'
+        t.transform.translation.x = float(x_cam)
+        t.transform.translation.y = float(y_cam)
+        t.transform.translation.z = float(z)
+        t.transform.rotation.w    = 1.0
+        self.tf_broadcaster.sendTransform(t)
+
+        self.get_logger().info(
+            f"[BOTTLE] z={z:.3f}m x={x_cam:.3f}m conf={conf:.2f}",
+            throttle_duration_sec=0.5)
+
+        cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
+        cv2.circle(debug, (u, v), 5, color, -1)
+        cv2.putText(debug, f"bottle z={z:.2f}m ({conf:.2f})", (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+    # =====================================================
+    # CLASS 2 — NET STRAP / COURT MARKER
+    # =====================================================
+    def _handle_strap(self, detection, cv_img, debug):
+        color = (0, 165, 255)   # orange
+
+        if detection is None:
+            cv2.putText(debug, "strap: not seen", (10, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 2)
+            return
+
+        conf, box = detection
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        u = (x1 + x2) // 2
+        h, w = debug.shape[:2]
+
+        # Normalised x: -1.0 (far left) → +1.0 (far right)
+        # Matches existing pole_callback expectation in ball_chaser.py
+        x_norm = (u - w / 2.0) / (w / 2.0)
+
+        pt = Point()
+        pt.x = x_norm
+        pt.y = 0.0
+        pt.z = 1.0   # placeholder — only direction matters, not depth
+        self.pub_pole.publish(pt)
+
+        self.get_logger().info(
+            f"[STRAP] x_norm={x_norm:.2f} conf={conf:.2f}",
+            throttle_duration_sec=0.5)
+
+        cv2.rectangle(debug, (x1, y1), (x2, y2), color, 2)
+        cv2.circle(debug, (u, (y1 + y2) // 2), 5, color, -1)
+        cv2.putText(debug, f"strap x={x_norm:.2f} ({conf:.2f})", (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+    # =====================================================
+    # DEPTH HELPER
+    # =====================================================
+    def _depth_at(self, u, v):
+        """Return depth in metres at pixel (u,v) using median ROI. None if invalid."""
+        if self.depth_img is None:
+            return None
+        h, w = self.depth_img.shape[:2]
+        r    = self.DEPTH_ROI
+        roi  = self.depth_img[
+            max(0, v - r):min(h, v + r + 1),
+            max(0, u - r):min(w, u + r + 1)
+        ].astype(float)
+        roi[roi == 0] = np.nan
+        z_mm = float(np.nanmedian(roi))
+        if np.isnan(z_mm) or z_mm <= 0:
+            return None
+        return z_mm / 1000.0
+
+    # =====================================================
+    # DEBUG IMAGE
+    # =====================================================
+    def _publish_debug(self, debug_img):
+        _, buf = cv2.imencode('.jpg', debug_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        msg = CompressedImage()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.format = "jpeg"
+        msg.data   = buf.tobytes()
+        self.pub_debug.publish(msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    rclpy.spin(RealSenseYOLOTracker())
-    rclpy.shutdown()
+    node = RealSenseTrackerYolo()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -35,8 +35,6 @@ class RealSenseTrackerYolo(Node):
 
     def __init__(self):
         super().__init__('realsense_tracker_yolo')
-        model = YOLO('/home/msr/ballbots_ros2_ws/install/ball_tracker/share/ball_tracker/best_train_model.pt')
-        print(model.names)
 
         # =====================================================
         # MODEL
@@ -93,9 +91,12 @@ class RealSenseTrackerYolo(Node):
         # Court pole / net strap
         self.pub_pole = self.create_publisher(Point, '/court_pole_position', 10)
 
-        # Debug — one compressed image showing all detections
+        # Debug — compressed (low bandwidth, for streaming)
         self.pub_debug = self.create_publisher(
             CompressedImage, '/yolo/debug_image/compressed', 10)
+        # Debug — uncompressed (for Foxglove / rosbag recording)
+        self.pub_debug_raw = self.create_publisher(
+            Image, '/yolo/debug_image', 10)
 
         self.get_logger().info("=" * 60)
         self.get_logger().info("RealSense YOLO Tracker started!")
@@ -153,12 +154,14 @@ class RealSenseTrackerYolo(Node):
             self.CLASS_STRAP:  None,
         }
 
-        # Keep highest-confidence detection per class
+        # Keep highest-confidence detection per class (hard filter — YOLO can leak below threshold)
         for result in results:
             for box in result.boxes:
                 cls  = int(box.cls[0])
                 conf = float(box.conf[0])
                 if cls not in best:
+                    continue
+                if conf < self.CONF_THRESHOLD:   # explicit guard
                     continue
                 if best[cls] is None or conf > best[cls][0]:
                     best[cls] = (conf, box)
@@ -331,12 +334,20 @@ class RealSenseTrackerYolo(Node):
     # DEBUG IMAGE
     # =====================================================
     def _publish_debug(self, debug_img):
+        stamp = self.get_clock().now().to_msg()
+
+        # Compressed — for live streaming
         _, buf = cv2.imencode('.jpg', debug_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        msg = CompressedImage()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.format = "jpeg"
-        msg.data   = buf.tobytes()
-        self.pub_debug.publish(msg)
+        cmsg = CompressedImage()
+        cmsg.header.stamp = stamp
+        cmsg.format = "jpeg"
+        cmsg.data   = buf.tobytes()
+        self.pub_debug.publish(cmsg)
+
+        # Uncompressed — for Foxglove / rosbag
+        raw = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
+        raw.header.stamp = stamp
+        self.pub_debug_raw.publish(raw)
 
 
 def main(args=None):

@@ -4,6 +4,12 @@
   <!-- Arguments -->
   <!-- ============================= -->
   <arg
+    name="use_yolo"
+    default="true"
+    description="true=YOLO tracker (default), false=HSV tracker"
+  />
+
+  <arg
     name="use_rviz"
     default="false"
     description="Launch RViz visualization"
@@ -17,6 +23,7 @@
 
   <!-- ============================= -->
   <!-- RealSense Camera Launch -->
+  <!-- Align depth to colour — required by both trackers -->
   <!-- ============================= -->
   <include
     file="$(find-pkg-share realsense2_camera)/launch/rs_launch.py">
@@ -24,7 +31,8 @@
   </include>
 
   <!-- ============================= -->
-  <!-- ZED Camera Launch — kept for odometry + bottle_tracker -->
+  <!-- ZED Camera Launch -->
+  <!-- Kept for odometry (/zed/zed_node/odom) -->
   <!-- ============================= -->
   <include
     file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
@@ -33,40 +41,44 @@
   </include>
 
   <!-- ============================= -->
-  <!-- Tennis Ball Tracker — DISABLED, RealSense used instead -->
+  <!-- YOLO Tracker (default)        -->
+  <!-- Replaces all three HSV nodes: -->
+  <!--   tennis_ball_tracker.py      -->
+  <!--   realsense_tracker.py        -->
+  <!--   bottle_tracker.py           -->
+  <!--                               -->
+  <!-- Launch with YOLO (default):   -->
+  <!--   ros2 launch ball_tracker    -->
+  <!--     tennis_ball_tracker.launch.xml -->
   <!-- ============================= -->
-  <!--
   <node
     pkg="ball_tracker"
-    exec="tennis_ball_tracker"
-    name="tennis_ball_tracker"
+    exec="realsense_tracker_yolo"
+    name="realsense_tracker_yolo"
     output="screen"
+    if="$(var use_yolo)"
   >
     <param name="debug_logs" value="$(var debug_logs)"/>
   </node>
-  -->
 
   <!-- ============================= -->
-  <!-- RealSense Tracker — remapped to ZED ball topic -->
+  <!-- HSV Tracker (fallback)        -->
+  <!-- RealSense handles ball +      -->
+  <!-- bottle + pole via HSV masks   -->
+  <!--                               -->
+  <!-- Launch with HSV:              -->
+  <!--   ros2 launch ball_tracker    -->
+  <!--     tennis_ball_tracker.launch.xml use_yolo:=false -->
   <!-- ============================= -->
   <node
     pkg="ball_tracker"
     exec="realsense_tracker"
     name="realsense_tracker"
     output="screen"
+    unless="$(var use_yolo)"
   >
     <param name="debug_logs" value="$(var debug_logs)"/>
     <remap from="/tennis_ball_position_close" to="/tennis_ball_position"/>
-  </node>
-
-  <!-- ============================= -->
-  <!-- Bottle Tracker -->
-  <!-- ============================= -->
-  <node
-    pkg="ball_tracker"
-    exec="bottle_tracker"
-    name="bottle_tracker"
-    output="screen">
   </node>
 
   <!-- ============================= -->

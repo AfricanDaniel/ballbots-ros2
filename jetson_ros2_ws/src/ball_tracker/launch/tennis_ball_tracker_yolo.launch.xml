@@ -1,0 +1,97 @@
+<launch>
+
+  <!-- ============================= -->
+  <!-- Arguments -->
+  <!-- ============================= -->
+  <arg
+    name="use_rviz"
+    default="false"
+    description="Launch RViz visualization"
+  />
+
+  <arg
+    name="debug_logs"
+    default="false"
+    description="Enable verbose detection logs"
+  />
+
+  <!-- ============================= -->
+  <!-- RealSense Camera Launch -->
+  <!-- Align depth to colour — required for YOLO depth lookup -->
+  <!-- ============================= -->
+  <include
+    file="$(find-pkg-share realsense2_camera)/launch/rs_launch.py">
+    <arg name="align_depth.enable" value="true"/>
+  </include>
+
+  <!-- ============================= -->
+  <!-- ZED Camera Launch -->
+  <!-- Still needed for odometry (/zed/zed_node/odom) -->
+  <!-- ============================= -->
+  <include
+    file="$(find-pkg-share zed_wrapper)/launch/zed_camera.launch.py">
+    <arg name="camera_model" value="zed2i"/>
+    <arg name="camera_name"  value="zed"/>
+  </include>
+
+  <!-- ============================= -->
+  <!-- YOLO Tracker — replaces:      -->
+  <!--   tennis_ball_tracker.py      -->
+  <!--   realsense_tracker.py        -->
+  <!--   bottle_tracker.py           -->
+  <!--                               -->
+  <!-- Publishes:                    -->
+  <!--   /tennis_ball_position       -->
+  <!--   /tennis_ball_position_close -->
+  <!--   /bottle_position            -->
+  <!--   /court_pole_position        -->
+  <!--   /yolo/debug_image/compressed-->
+  <!-- ============================= -->
+  <node
+    pkg="ball_tracker"
+    exec="realsense_tracker_yolo"
+    name="realsense_tracker_yolo"
+    output="screen"
+  >
+    <param name="debug_logs" value="$(var debug_logs)"/>
+  </node>
+
+  <!-- ============================= -->
+  <!-- DISABLED — replaced by YOLO   -->
+  <!-- ============================= -->
+<!--
+  <node
+    pkg="ball_tracker"
+    exec="tennis_ball_tracker"
+    name="tennis_ball_tracker"
+    output="screen"
+  />
+
+  <node
+    pkg="ball_tracker"
+    exec="realsense_tracker"
+    name="realsense_tracker"
+    output="screen"
+  />
+
+  <node
+    pkg="ball_tracker"
+    exec="bottle_tracker"
+    name="bottle_tracker"
+    output="screen"
+  />
+-->
+
+  <!-- ============================= -->
+  <!-- RViz (optional) -->
+  <!-- ============================= -->
+  <node
+    pkg="rviz2"
+    exec="rviz2"
+    name="rviz2"
+    output="screen"
+    if="$(var use_rviz)"
+    args="-d $(find-pkg-share ball_tracker)/config/tennis_visualization.rviz"
+  />
+
+</launch>

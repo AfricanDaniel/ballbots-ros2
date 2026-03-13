@@ -10,7 +10,7 @@
     # --- Servo Physical Limits (Degrees) ---
     # 252.0 = Horizontal (Arm Up)
     # 177.0 = Vertical (Arm Down / Camera looking at floor)
-    arm_raised_deg: 262.0
+    arm_raised_deg: 270.0
     arm_lowered_deg: 177.0
 
     # --- Claw Positions ---

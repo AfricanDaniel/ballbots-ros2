@@ -48,9 +48,9 @@ class BallChaser(Node):
         self.COURT_TURN_DEG        = 40.0   # degrees LEFT at startup to face court
         self.RETURN_TURN_DEG       = 60.0   # degrees to turn after drop (USE_POLE_DETECTION=False)
 
-        self.BALL_STILL_SECS         = 3.0
-        self.BALL_STILL_THRESHOLD_X  = 0.1
-        self.BALL_STILL_THRESHOLD_Z  = 0.4
+        self.BALL_STILL_FRAMES       = 4     # consecutive still frames needed (4 @ 2Hz ≈ 2s)
+        self.BALL_STILL_THRESHOLD_X  = 0.04  # max x change between frames (metres)
+        self.BALL_STILL_THRESHOLD_Z  = 0.15  # max z change between frames (metres, <4m only)
         self.DROP_EXCLUSION_RADIUS   = 0.2
         self.BOTTLE_TURN_TIMEOUT     = 370.0
 
@@ -61,7 +61,7 @@ class BallChaser(Node):
         # =====================================================
         self.USE_POLE_DETECTION = True
 
-        self.POLE_CONFIRM_NEEDED = 5      # consecutive frames before trusting pole
+        self.POLE_CONFIRM_NEEDED = 2      # consecutive frames before trusting pole
         self.POLE_ALIGN_DEG      = 0.0   # degrees to nudge RIGHT after seeing pole
                                            # tune so robot ends up facing the court
 
@@ -125,8 +125,8 @@ class BallChaser(Node):
         self._turn_settle_since   = None
 
         # Ball stillness
-        self._ball_history     = deque(maxlen=90)
-        self._ball_still_since = None
+        self._ball_history     = deque(maxlen=2)  # only need last 2 frames
+        self._ball_still_count = 0               # consecutive still frames
 
         # Drop zone
         self._drop_position = None
@@ -147,6 +147,7 @@ class BallChaser(Node):
         self.is_aligned  = False
         self.current_vx  = 0.0
         self.MAX_ACCEL   = 0.02
+        self._smooth_x   = None   # EMA of ball x during chasing
 
         # Grab/drop
         self.grab_confirm_count  = 0
@@ -203,7 +204,7 @@ class BallChaser(Node):
             self.court_yaw = self.bottle_yaw_locked = None
             self._drop_position = None
             self._ball_history.clear()
-            self._ball_still_since = None
+            self._ball_still_count = 0
             self.grab_confirm_count = 0
             self._bottle_confirm_count = 0
             self._pole_confirm_count = 0
@@ -323,19 +324,16 @@ class BallChaser(Node):
 
         # ─── SEARCHING COURT POLE: rotate left until pole seen ───────
         elif self.state == 'SEARCHING_COURT_POLE':
-            # pole_callback() handles state transition — just keep rotating left
-            cmd.angular.z = 0.3   # CCW = left
-            self.pub_cmd.publish(cmd)
+            # Stop immediately on first pole sighting — pole_callback handles that
+            if self._pole_confirm_count == 0:
+                cmd.angular.z = 0.3   # CCW = left
+                self.pub_cmd.publish(cmd)
 
         # ─── ALIGNING TO COURT: nudge right after pole seen ──────────
         elif self.state == 'ALIGNING_TO_COURT':
             if self._pole_align_yaw is None:
-                # Turn right (CW) by POLE_ALIGN_DEG from where we saw the pole
-                self._pole_align_yaw = self._wrap(
-                    self.current_yaw - math.radians(self.POLE_ALIGN_DEG))
-                self.get_logger().info(
-                    f"🎾 Nudging right {self.POLE_ALIGN_DEG}° → "
-                    f"target={math.degrees(self._pole_align_yaw):.1f}°")
+                self.get_logger().info("✅ Pole confirmed — transitioning to WAITING_FOR_BALL")
+                self._pole_align_yaw = self.current_yaw  # dummy value so diff=0 below
 
             diff = self._adiff(self._pole_align_yaw, self.current_yaw)
             if abs(diff) < 0.08:
@@ -347,7 +345,7 @@ class BallChaser(Node):
                     self._pole_align_yaw     = None
                     self._pole_confirm_count = 0
                     self._ball_history.clear()
-                    self._ball_still_since = None
+                    self._ball_still_count = 0
                     self.state = 'WAITING_FOR_BALL'
                     self.get_logger().info("✅ Aligned to court — waiting for next ball...")
                 self.stop_robot()
@@ -373,7 +371,7 @@ class BallChaser(Node):
                     self._turn_settle_since = None
                     self._turn_start_yaw    = None
                     self._ball_history.clear()
-                    self._ball_still_since = None
+                    self._ball_still_count = 0
                     self.state = 'WAITING_FOR_BALL'
                     self.get_logger().info("✅ Facing court again — waiting for next ball...")
                 self.stop_robot()
@@ -421,12 +419,16 @@ class BallChaser(Node):
         if self.state not in valid_states: return
         if not self.USE_POLE_DETECTION: return
 
+        # Stop rotating immediately on first sighting
+        if self._pole_confirm_count == 0:
+            self.stop_robot()
+            self.get_logger().info("🎾 Pole spotted — stopped! Confirming...")
+
         self._pole_confirm_count += 1
         self.get_logger().info(
             f"🎾 Court pole seen ({self._pole_confirm_count}/{self.POLE_CONFIRM_NEEDED})")
 
         if self._pole_confirm_count >= self.POLE_CONFIRM_NEEDED:
-            self.stop_robot()
             self._pole_align_yaw = None
             self._turn_settle_since = None
             self._init_pole_search_started = False  # reset for next time
@@ -451,6 +453,7 @@ class BallChaser(Node):
             self.stop_robot()
             self.is_aligned = False
             self.grab_confirm_count = 0
+            self._smooth_x = None
             return
 
         if msg.z <= self.grab_dist and abs(msg.x) < 0.06:
@@ -529,48 +532,43 @@ class BallChaser(Node):
             if math.sqrt(dx * dx + dy * dy) < self.DROP_EXCLUSION_RADIUS:
                 return
 
-        now = self.get_clock().now().nanoseconds / 1e9
-        self._ball_history.append((now, msg.x, msg.z))
+        # Compare this frame against the previous one
+        if len(self._ball_history) > 0:
+            _, prev_x, prev_z = self._ball_history[-1]
+            dx = abs(msg.x - prev_x)
+            dz = abs(msg.z - prev_z)
 
-        if len(self._ball_history) < 5:
-            return
+            # Beyond 4m RealSense z is too noisy — only check x
+            z_ok = True if msg.z > 4.0 else dz < self.BALL_STILL_THRESHOLD_Z
+            x_ok = dx < self.BALL_STILL_THRESHOLD_X
 
-        recent = [(t, x, z) for t, x, z in self._ball_history
-                  if now - t <= self.BALL_STILL_SECS]
+            if x_ok and z_ok:
+                self._ball_still_count += 1
+            else:
+                if self._ball_still_count > 0:
+                    self.get_logger().info(
+                        f"🏃 Ball moved (dx={dx:.3f}m dz={dz:.3f}m) — resetting counter")
+                self._ball_still_count = 0
 
-        if len(recent) < 3:
-            self._ball_still_since = None
-            return
+            self.get_logger().info(
+                f"⏳ Still check: dx={dx:.3f}m dz={dz:.3f}m "
+                f"count={self._ball_still_count}/{self.BALL_STILL_FRAMES}",
+                throttle_duration_sec=1.0)
 
-        xs = [x for _, x, _ in recent]
-        zs = [z for _, _, z in recent]
-        x_spread = max(xs) - min(xs)
-        z_spread = max(zs) - min(zs)
-        x_still  = x_spread < self.BALL_STILL_THRESHOLD_X
-        z_still  = z_spread < self.BALL_STILL_THRESHOLD_Z
-
-        if x_still and z_still:
-            if self._ball_still_since is None:
-                self._ball_still_since = now
+            if self._ball_still_count >= self.BALL_STILL_FRAMES:
                 self.get_logger().info(
-                    f"⏳ Ball looks still (x={x_spread:.3f}m z={z_spread:.3f}m) — "
-                    f"waiting {self.BALL_STILL_SECS}s...",
-                    throttle_duration_sec=1.0
-                )
-            elapsed = now - self._ball_still_since
-            if elapsed >= self.BALL_STILL_SECS:
-                self.get_logger().info(f"🎾 Ball still for {self.BALL_STILL_SECS}s — CHASING!")
+                    f"🎾 Ball still for {self.BALL_STILL_FRAMES} frames — CHASING!")
                 self.stop_robot()
                 self.state = 'CHASING_ZED'
                 self.is_aligned = False
                 self.grab_confirm_count = 0
+                self._smooth_x = None
                 self._ball_history.clear()
-                self._ball_still_since = None
-        else:
-            if self._ball_still_since is not None:
-                self.get_logger().info(
-                    f"🏃 Ball moved (x={x_spread:.3f}m z={z_spread:.3f}m) — resetting timer")
-            self._ball_still_since = None
+                self._ball_still_count = 0
+                return
+
+        now = self.get_clock().now().nanoseconds / 1e9
+        self._ball_history.append((now, msg.x, msg.z))
 
     # =====================================================
     # BOTTLE CALLBACK

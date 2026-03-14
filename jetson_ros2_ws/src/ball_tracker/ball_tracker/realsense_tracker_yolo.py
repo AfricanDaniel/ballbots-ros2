@@ -40,7 +40,7 @@ class RealSenseTrackerYolo(Node):
         # MODEL
         # =====================================================
         model_path = os.path.join(
-            get_package_share_directory('ball_tracker'), 'best_train_model.pt')
+            get_package_share_directory('ball_tracker'), 'realsense_best_train_model.pt')
 
         self.get_logger().info(f"Loading YOLO model from: {model_path}")
         device = 'cpu'

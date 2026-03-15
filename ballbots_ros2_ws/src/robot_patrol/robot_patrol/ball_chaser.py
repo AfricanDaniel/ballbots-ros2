@@ -32,6 +32,7 @@ class BallChaser(Node):
                 ('target_dist',      0.10),
                 ('tilt_start_dist',  0.01),
                 ('grab_dist',        0.16),
+                ('use_zed',          False),
             ]
         )
         self.ARM_HORIZONTAL  = self.get_parameter('arm_raised_deg').value
@@ -41,6 +42,7 @@ class BallChaser(Node):
         self.target_dist     = self.get_parameter('target_dist').value
         self.tilt_start_dist = self.get_parameter('tilt_start_dist').value
         self.grab_dist       = self.get_parameter('grab_dist').value
+        self.use_zed         = self.get_parameter('use_zed').value
 
         # =====================================================
         # MISSION TUNING
@@ -49,8 +51,8 @@ class BallChaser(Node):
         self.RETURN_TURN_DEG       = 60.0   # degrees to turn after drop (USE_POLE_DETECTION=False)
 
         self.BALL_STILL_FRAMES       = 4     # consecutive still frames needed (4 @ 2Hz ≈ 2s)
-        self.BALL_STILL_THRESHOLD_X  = 0.04  # max x change between frames (metres)
-        self.BALL_STILL_THRESHOLD_Z  = 0.15  # max z change between frames (metres, <4m only)
+        self.BALL_STILL_THRESHOLD_X  = 0.10  # max x change between frames (metres)
+        self.BALL_STILL_THRESHOLD_Z  = 0.50  # max z change between frames (metres, <4m only)
         self.DROP_EXCLUSION_RADIUS   = 0.2
         self.BOTTLE_TURN_TIMEOUT     = 370.0
 
@@ -151,7 +153,7 @@ class BallChaser(Node):
 
         # Grab/drop
         self.grab_confirm_count  = 0
-        self.GRAB_CONFIRM_NEEDED = 3
+        self.GRAB_CONFIRM_NEEDED = 2
         self.arm_angle           = self.ARM_HORIZONTAL
         self._active_action      = None
         self._arm_sweep_timer    = None
@@ -166,7 +168,8 @@ class BallChaser(Node):
 
         self.get_logger().info("Full Mission Ball Chaser node started!")
         self.get_logger().info(
-            f"  USE_POLE_DETECTION={self.USE_POLE_DETECTION}  "
+            f"  use_zed={self.use_zed}  "
+            f"USE_POLE_DETECTION={self.USE_POLE_DETECTION}  "
             f"POLE_ALIGN_DEG={self.POLE_ALIGN_DEG}°  "
             f"RETURN_TURN_DEG={self.RETURN_TURN_DEG}°")
 
@@ -317,7 +320,7 @@ class BallChaser(Node):
         # ─── SEARCHING BOTTLE ────────────────────────────────────────
         elif self.state == 'SEARCHING_BOTTLE':
             if not self._search_spinning:
-                cmd.angular.z = 0.35
+                cmd.angular.z = 0.6
                 self.pub_cmd.publish(cmd)
                 self._search_spinning = True
                 self._search_timer = self.create_timer(0.5, self._search_pause_cb)
@@ -440,6 +443,7 @@ class BallChaser(Node):
     # =====================================================
     def zed_callback(self, msg):
         if not self.is_active: return
+        if not self.use_zed: return
 
         if self.state in ('WAITING_FOR_BALL',):
             self._track_ball_stillness(msg)
@@ -470,6 +474,11 @@ class BallChaser(Node):
             target_wz = max(-0.25, min(0.25, -0.6 * msg.x))
             if abs(msg.x) < 0.05:
                 self.is_aligned = True
+            else:
+                # Creep forward while turning — scale speed down by misalignment
+                # align_scale: 1.0 at x=0, 0.0 at x=±0.2m
+                align_scale = max(0.0, 1.0 - abs(msg.x) / 0.2)
+                target_vx = max(0.0, min(0.12, 0.3 * (msg.z - self.target_dist))) * align_scale
         else:
             target_vx = max(-0.3, min(0.3, 0.5 * (msg.z - self.target_dist)))
             target_wz = max(-0.15, min(0.15, -0.5 * msg.x))
@@ -484,13 +493,20 @@ class BallChaser(Node):
     # REALSENSE CALLBACK (close range)
     # =====================================================
     def rs_callback(self, msg):
-        if not self.is_active or self.state != 'CHASING_RS': return
+        if not self.is_active: return
         if math.isnan(msg.z) or msg.z <= 0.0: return
+
+        # RS-only mode: also handle ball stillness detection while waiting
+        if not self.use_zed and self.state == 'WAITING_FOR_BALL':
+            self._track_ball_stillness(msg)
+            return
+
+        if self.state != 'CHASING_RS': return
 
         claw_offset_x = 0.01
         err_x = msg.x - claw_offset_x
 
-        if msg.z <= self.grab_dist and abs(err_x) < 0.06:
+        if msg.z <= self.grab_dist and abs(err_x) < 0.10:
             self.grab_confirm_count += 1
             if self.grab_confirm_count >= self.GRAB_CONFIRM_NEEDED:
                 self.execute_grab()
@@ -501,11 +517,12 @@ class BallChaser(Node):
         target_vx = 0.0
         target_wz  = 0.0
         if not self.is_aligned:
-            target_wz = max(-0.25, min(0.25, -0.8 * err_x))
-            if abs(err_x) < 0.03:
+            # Stop and rotate only — no forward motion until roughly aligned
+            target_wz = max(-0.2, min(0.2, -0.5 * err_x))
+            if abs(err_x) < 0.10:
                 self.is_aligned = True
         else:
-            target_vx = max(-0.15, min(0.15, 0.4 * msg.z))
+            target_vx = max(0.0, min(0.3, 0.4 * msg.z))
             target_wz = max(-0.1,  min(0.1,  -0.5 * err_x))
 
         self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
@@ -519,7 +536,9 @@ class BallChaser(Node):
     # =====================================================
     def _track_ball_stillness(self, msg):
         # Ignore very close detections — likely dropped ball or noise
-        if msg.z < 1.0:
+        # ZED blind spot is <0.6m so 0.6m is a safe lower bound; RS-only can see from ~0.3m
+        min_z = 0.6 if self.use_zed else 0.3
+        if msg.z < min_z:
             return
 
         if self._drop_position is not None:
@@ -545,10 +564,9 @@ class BallChaser(Node):
             if x_ok and z_ok:
                 self._ball_still_count += 1
             else:
-                if self._ball_still_count > 0:
-                    self.get_logger().info(
-                        f"🏃 Ball moved (dx={dx:.3f}m dz={dz:.3f}m) — resetting counter")
-                self._ball_still_count = 0
+                self._ball_still_count = max(0, self._ball_still_count - 1)
+                self.get_logger().info(
+                    f"🏃 Noisy frame (dx={dx:.3f}m dz={dz:.3f}m) — count={self._ball_still_count}/{self.BALL_STILL_FRAMES}")
 
             self.get_logger().info(
                 f"⏳ Still check: dx={dx:.3f}m dz={dz:.3f}m "
@@ -556,10 +574,11 @@ class BallChaser(Node):
                 throttle_duration_sec=1.0)
 
             if self._ball_still_count >= self.BALL_STILL_FRAMES:
+                next_state = 'CHASING_ZED' if self.use_zed else 'CHASING_RS'
                 self.get_logger().info(
-                    f"🎾 Ball still for {self.BALL_STILL_FRAMES} frames — CHASING!")
+                    f"🎾 Ball still for {self.BALL_STILL_FRAMES} frames — CHASING! ({next_state})")
                 self.stop_robot()
-                self.state = 'CHASING_ZED'
+                self.state = next_state
                 self.is_aligned = False
                 self.grab_confirm_count = 0
                 self._smooth_x = None
@@ -602,13 +621,10 @@ class BallChaser(Node):
             return
 
         err_dist  = msg.z - drop_dist
-        target_vx = max(0.0, min(0.25, 0.4 * err_dist))
-        target_wz = max(-0.20, min(0.20, -0.3 * msg.x))
+        target_vx = max(0.0, min(0.4, 0.6 * err_dist))
+        target_wz = max(-0.18, min(0.18, -0.25 * msg.x))
 
-        if abs(msg.x) > 0.50:
-            target_vx = 0.0
-
-        self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
+        self.current_vx = target_vx  # no ramp — accuracy not needed, start moving immediately
         cmd = Twist()
         cmd.linear.x = self.current_vx
         cmd.angular.z = target_wz

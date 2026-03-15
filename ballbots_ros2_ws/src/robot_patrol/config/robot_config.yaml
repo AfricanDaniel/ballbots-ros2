@@ -19,5 +19,10 @@
 
     # --- Tracking Behavior ---
     target_dist: 0.1
-    grab_dist: 0.16
-    tilt_start_dist: 0.01
+    grab_dist: 0.30
+    tilt_start_dist: 0.6
+
+    # --- Camera Mode ---
+    # use_zed: false → RealSense only for all ranges (Choice 1, default)
+    # use_zed: true  → ZED for far range, RealSense for close range (Choice 2)
+    use_zed: false

@@ -136,19 +136,45 @@ winter_project/
 
 ```
 IDLE
-  └─► INIT_SCAN_BOTTLE       (lock drop-zone bottle TF)
-        └─► INIT_TURN_TO_COURT   (rotate to face court / find pole)
-              └─► WAITING_FOR_BALL   (wait for ball still 3s in <0.1m×0.4m window)
-                    └─► CHASING_ZED       (approach with ZED, far range)
-                          └─► CHASING_RS      (close approach with RealSense)
-                                └─► GRABBING        (arm down → claw close → arm up)
-                                      └─► TURNING_TO_BOTTLE
-                                            └─► SEARCHING_BOTTLE
-                                                  └─► CHASING_BOTTLE
-                                                        └─► DROPPING       (arm down → claw open → arm up)
-                                                              └─► SEARCHING_COURT_POLE
-                                                                    └─► ALIGNING_TO_COURT
-                                                                          └─► WAITING_FOR_BALL (repeat)
+  │
+  ▼
+INIT_SCAN_BOTTLE        lock drop-zone bottle TF
+  │
+  ▼
+INIT_TURN_TO_COURT      rotate to face court / find pole
+  │
+  ▼
+WAITING_FOR_BALL        wait for ball still (4 frames, soft-reset)
+  │
+  ▼
+CHASING_ZED             approach with ZED, far range  [use_zed=true only]
+  │
+  ▼
+CHASING_RS              close approach with RealSense
+  │
+  ▼
+GRABBING                arm down → claw close → arm up
+  │
+  ▼
+TURNING_TO_BOTTLE       rotate to known bottle direction
+  │
+  ▼
+SEARCHING_BOTTLE        sweep scan until bottle visible
+  │
+  ▼
+CHASING_BOTTLE          drive to bottle, stop at 0.6 m
+  │
+  ▼
+DROPPING                arm down → claw open → arm up
+  │
+  ▼
+SEARCHING_COURT_POLE    rotate left until pole visible
+  │
+  ▼
+ALIGNING_TO_COURT       nudge right to face court
+  │
+  ▼
+WAITING_FOR_BALL        (repeat)
 ```
 
 ## Quick Start

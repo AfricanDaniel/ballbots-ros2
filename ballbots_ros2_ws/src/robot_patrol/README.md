@@ -44,24 +44,32 @@ INIT_SCAN_BOTTLE          Lock drop-zone bottle transform (TF neon_bottle)
 INIT_TURN_TO_COURT        Rotate 40° left to face court
   │                         (if USE_COURT_POLE: search for red pole instead)
   ▼
-WAITING_FOR_BALL          Wait until ball is stationary for 3s
-  │                         (within 0.1m lateral, 0.4m forward window)
+WAITING_FOR_BALL          Wait until ball is stationary for 4 consecutive frames
+  │                         (dx < 0.10m, dz < 0.50m; noisy frames decrement count
+  │                          by 1 instead of resetting — soft reset)
   ▼
 CHASING_ZED               Drive toward ball using ZED far-range detection
-  │                         (proportional angular + fixed linear speed)
-  │                         (handoff to RS when z < 0.01m)
+  │                         (proportional angular + linear speed)
+  │                         (handoff to RS when z < tilt_start_dist = 0.6m)
   ▼
-CHASING_RS                Close-range approach with RealSense
-  │                         (arm tilts based on distance)
+CHASING_RS                Two-phase close approach with RealSense:
+  │   Phase 1 — Align: stop and rotate until |err_x| < 0.10m
+  │             (forced forward after 4s oscillation timeout)
+  │   Phase 2 — Drive:
+  │             z > tilt_start_dist (0.6m): fast approach up to 0.4 m/s
+  │             z ≤ tilt_start_dist (0.6m): slow approach max 0.15 m/s
+  │             (stops and grabs when z ≤ grab_dist = 0.30m)
   ▼
 GRABBING                  Arm sweep down → pause → claw close → arm raise
   ▼
 TURNING_TO_BOTTLE         Rotate to face locked bottle direction (from odometry)
   ▼
-SEARCHING_BOTTLE          Slow scan sweep until bottle visible
-  │                         (0.5s spin, 0.3s pause cycles)
+SEARCHING_BOTTLE          Scan sweep until bottle visible
+  │                         (0.6 rad/s spin, 0.5s spin / 0.3s pause cycles)
   ▼
-CHASING_BOTTLE            Drive toward bottle, stop at 0.6m
+CHASING_BOTTLE            Drive toward bottle at up to 0.4 m/s, stop at 0.6m
+  │                         (always drives forward while correcting heading;
+  │                          no deceleration ramp — speed applied instantly)
   ▼
 DROPPING                  Arm sweep down → pause → claw open → arm raise
   ▼
@@ -77,15 +85,19 @@ WAITING_FOR_BALL          (repeat mission)
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `arm_horizontal_angle` | 270° | Arm fully raised |
-| `arm_down_angle` | 177° | Arm lowered for grab/drop |
-| `claw_open_angle` | 152° | Claw open |
-| `claw_closed_angle` | 173–175° | Claw closed |
-| `grab_distance` | 0.16 m | Distance to stop before grabbing |
-| `bottle_approach_distance` | 0.6 m | Distance to stop at drop zone |
-| `ball_stillness_window_x` | 0.1 m | Ball must stay within this x-range to count as still |
-| `ball_stillness_window_z` | 0.4 m | Ball must stay within this z-range to count as still |
-| `ball_stillness_time` | 3 s | How long ball must be still before chase begins |
+| `arm_raised_deg` | 270° | Arm fully raised |
+| `arm_lowered_deg` | 177° | Arm lowered for grab/drop |
+| `claw_open_deg` | 152° | Claw open |
+| `claw_closed_deg` | 175° | Claw closed |
+| `grab_dist` | 0.30 m | Distance to stop and grab ball |
+| `tilt_start_dist` | 0.60 m | Distance to switch from fast to slow approach (also ZED→RS handoff) |
+| `target_dist` | 0.10 m | Proportional speed zero-point during final approach |
+| `bottle_approach_dist` | 0.6 m | Distance to stop at drop zone |
+| `BALL_STILL_THRESHOLD_X` | 0.10 m | Max x-change between frames to count as still |
+| `BALL_STILL_THRESHOLD_Z` | 0.50 m | Max z-change between frames to count as still (< 4 m only) |
+| `BALL_STILL_FRAMES` | 4 | Consecutive still frames required before chasing |
+| `ALIGN_TIMEOUT` | 4.0 s | Force forward motion after this many seconds of alignment oscillation |
+| `GRAB_CONFIRM_NEEDED` | 2 | Consecutive detections at grab distance before triggering grab |
 
 ---
 
@@ -157,16 +169,20 @@ ros2 launch robot_patrol start_tennis_bot.launch.xml use_servo:=false
 `config/robot_config.yaml` contains all hardware-specific parameters:
 
 ```yaml
-robot_patrol:
+/**:
   ros__parameters:
-    arm_id: 0                    # Dynamixel servo ID for arm
-    claw_id: 1                   # Dynamixel servo ID for claw
-    arm_horizontal_angle: 270.0  # Arm raised (degrees)
-    arm_down_angle: 177.0        # Arm lowered (degrees)
-    claw_open_angle: 152.0       # Claw open (degrees)
-    claw_closed_angle: 175.0     # Claw closed (degrees)
-    grab_distance: 0.16          # Meters
-    bottle_approach_distance: 0.6
+    device_name: '/dev/ttyUSB0'
+    baudrate: 57600
+    arm_id: 0                  # Dynamixel servo ID for arm
+    claw_id: 1                 # Dynamixel servo ID for claw
+    arm_raised_deg: 270.0      # Arm fully raised (degrees)
+    arm_lowered_deg: 177.0     # Arm lowered for grab/drop (degrees)
+    claw_open_deg: 152.0       # Claw open (degrees)
+    claw_closed_deg: 175.0     # Claw closed (degrees)
+    target_dist: 0.1           # Speed zero-point during final approach (metres)
+    grab_dist: 0.30            # Stop and grab when ball is this close (metres)
+    tilt_start_dist: 0.6       # Switch fast→slow approach; ZED→RS handoff (metres)
+    use_zed: false             # false = RealSense only; true = ZED far + RS close
 ```
 
 ---
@@ -190,9 +206,9 @@ ros2 launch robot_patrol start_tennis_bot.launch.xml
 `ball_chaser` uses `/tennis_ball_position` (from `zed_tracker_yolo` or `zed_tracker`) for the `CHASING_ZED` state, then hands off to `/tennis_ball_position_close` (RealSense) for the `CHASING_RS` state.
 
 ```
-Ball z > 0.01 m  →  CHASING_ZED  (ZED far range, better 3D accuracy at distance)
-Ball z < 0.01 m  →  CHASING_RS   (RealSense close range, handles ZED blind spot)
-Ball not visible →  Blind-spot creep (small fixed forward motion)
+Ball z > tilt_start_dist (0.6m)  →  CHASING_ZED  (ZED far range, better 3D accuracy at distance)
+Ball z < tilt_start_dist (0.6m)  →  CHASING_RS   (RealSense close range, handles ZED blind spot)
+Ball not visible                 →  Blind-spot creep (small fixed forward motion)
 ```
 
 The RealSense's `/tennis_ball_position_close` topic also acts as a trigger signal — when it publishes, the state machine transitions from `CHASING_ZED` to `CHASING_RS`.

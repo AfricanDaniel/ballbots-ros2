@@ -78,12 +78,45 @@ winter_project/
 | Component | Details |
 |-----------|---------|
 | Robot chassis | Mecanum wheel platform |
-| Drive motors | 4x brushless motors via ODrive ESCs (CAN bus) |
+| Drive motors | 4x brushless motors via ODrive S1 ESCs (CAN bus) |
 | Robot computer | Raspberry Pi |
 | Perception computer | Jetson Orin Nano |
 | Far-range camera | ZED 2i stereo camera |
 | Close-range camera | Intel RealSense D435i RGBD camera |
-| Claw actuator | 2x Dynamixel servos (arm ID=0, claw ID=1) via `/dev/ttyUSB0` |
+| Claw actuator | 2x Dynamixel servos (arm ID=0, claw ID=1) via `/dev/ttyUSB0` — designed and validated in simulation before hardware deployment |
+| Battery | 6S LiPo, 22.2 V nominal |
+
+### Power Distribution
+
+```
+                 ┌──────────────────────┐
+                 │     6S Battery        │
+                 │   22.2 V Nominal      │
+                 └─────────┬────────────┘
+                           │
+                 ┌─────────▼────────────┐
+                 │   Circuit Breaker     │
+                 └─────────┬────────────┘
+                           │
+           ┌───────────────┴────────────────┐
+           │                                │
+   ┌───────▼──────────┐             ┌──────▼───────────┐
+   │  E-Stop Relay     │             │  DC-DC Converters│
+   │ (motor power only)│             │  (always on)     │
+   └───────┬──────────┘             └────────┬─────────┘
+           │                                 │
+  ┌────────▼────────┐        ┌───────────────┼───────────────┐
+  │ Motor Power Bus │        │               │               │
+  └─────┬─────┬────┘   ┌────▼────┐     ┌────▼────┐     ┌────▼────┐
+        │     │        │  5V ISO │     │  19V    │     │  12V    │
+     ODrive  ODrive    │ DC-DC   │     │ DC-DC   │     │ DC-DC   │
+      S1s     S1s      └────┬────┘     └────┬────┘     └────┬────┘
+   (FL, RL) (FR, RR)        │               │               │
+                       Raspberry Pi    Jetson Orin      Dynamixel
+                          + LEDs          Nano            PHB
+```
+
+> **E-Stop** cuts motor power only — the Raspberry Pi, Jetson, and servos remain powered through the always-on DC-DC converters.
 
 ## ROS2 Topics (Cross-System)
 
@@ -180,6 +213,37 @@ The custom YOLO model (`best_train_model.pt`) is trained to detect:
 - Class 1: Water bottle (drop zone marker)
 - Class 2: Court net strap / pole
 
+### HSV vs YOLO Trade-offs
+
+**Tennis Ball**
+
+| | HSV | YOLOv8 |
+|-|-----|--------|
+| **Pro** | Extremely fast, no training data needed | Reliable at distance under varied/harsh lighting |
+| **Pro** | Tuning a color range takes minutes | Lighting changes and shadows don't affect quality |
+| **Con** | Highly lighting-dependent — shadows or sun can push values out of threshold | Requires manually annotated court footage |
+| **Con** | False triggers on any neon-yellow object on court | Slower inference; robot must reduce speed to stay in sync |
+
+**Water Bottle (Drop Zone)**
+
+| | HSV | YOLOv8 |
+|-|-----|--------|
+| **Pro** | Any distinctively colored object works; zero latency | No risk of confusing court markings or cones for home |
+| **Pro** | Swap colors in config to change the landmark | Works across lighting conditions without re-tuning |
+| **Con** | Color must not appear elsewhere in the scene | Model not trained on diverse bottle shapes — unusual bottles may fail |
+| **Con** | Requires manually selecting a unique landmark color | Requires retraining if the home object changes |
+
+**Court Net Strap (Court Orientation)**
+
+The net strap is the same white as court lines, making HSV filtering impractical without physically attaching a colored marker to the strap before each session. The YOLO model detects the strap by shape and position within the net — no court modification required.
+
+| | HSV | YOLOv8 |
+|-|-----|--------|
+| **Con** | Requires a colored marker taped to the strap before every session | Needs representative training data of the strap |
+| **Con** | Court lines are also white — impossible to isolate otherwise | — |
+| **Pro** | — | Works on any standard court with no physical setup |
+| **Pro** | — | Consistent across different net colors and lighting |
+
 ## Building
 
 ### Robot workspace (on Raspberry Pi)
@@ -193,6 +257,18 @@ colcon build --cmake-args -DBUILD_TESTING=OFF -DBUILD_ROBOT=ON
 cd jetson_ros2_ws
 colcon build --packages-select ball_tracker
 ```
+
+## Key Technical Challenges
+
+| Challenge | Solution |
+|-----------|----------|
+| **Camera blind spots** | ZED has a ~0.6 m minimum range; RealSense handles the close zone. `ball_chaser` seamlessly hands off between cameras at `tilt_start_dist = 0.6 m`. |
+| **Ghost frame oscillation** | YOLO detections are noisy. Angular controllers use low gains and caps so a single phantom detection can't yank the robot sideways. A 4-second alignment timeout forces forward motion if the robot oscillates in place. |
+| **Ball stillness detection** | Rolling balls are ignored. 4 consecutive frames must fall within 0.10 m laterally / 0.50 m in depth. A soft-reset (decrement by 1 on a bad frame) prevents one noisy detection from wiping accumulated stability. |
+| **Drop zone exclusion** | After dropping a ball, its world-frame position is logged. `WAITING_FOR_BALL` ignores any detection within 0.2 m of a known drop location to prevent re-chasing just-released balls. |
+| **ODrive initialization** | All 4 motor axes must enter closed-loop control before the driver accepts any wheel commands. Retry logic clears faults and re-attempts up to 5 times per axis. |
+| **Distributed compute** | Vision (YOLO, ZED SDK) runs on the Jetson GPU; motion control runs on the Pi — coordinated purely over ROS2 topics across the network with no shared memory. |
+| **E-Stop safety** | The E-Stop relay cuts motor power only. Compute (Pi + Jetson) and servos run through always-on DC-DC converters, so the robot's brain stays live for safe inspection and recovery after a stop. |
 
 ## Package READMEs
 

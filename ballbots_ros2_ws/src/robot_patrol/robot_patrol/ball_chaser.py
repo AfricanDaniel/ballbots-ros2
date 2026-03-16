@@ -146,10 +146,12 @@ class BallChaser(Node):
         self._search_timer    = None
 
         # Alignment / velocity
-        self.is_aligned  = False
-        self.current_vx  = 0.0
-        self.MAX_ACCEL   = 0.02
-        self._smooth_x   = None   # EMA of ball x during chasing
+        self.is_aligned       = False
+        self._align_start_t   = None   # time we entered not-aligned phase
+        self.ALIGN_TIMEOUT    = 4.0    # seconds before forcing forward motion
+        self.current_vx       = 0.0
+        self.MAX_ACCEL        = 0.02
+        self._smooth_x        = None   # EMA of ball x during chasing
 
         # Grab/drop
         self.grab_confirm_count  = 0
@@ -456,6 +458,7 @@ class BallChaser(Node):
             self.state = 'CHASING_RS'
             self.stop_robot()
             self.is_aligned = False
+            self._align_start_t = self.get_clock().now().nanoseconds / 1e9
             self.grab_confirm_count = 0
             self._smooth_x = None
             return
@@ -519,10 +522,19 @@ class BallChaser(Node):
         if not self.is_aligned:
             # Stop and rotate only — no forward motion until roughly aligned
             target_wz = max(-0.2, min(0.2, -0.5 * err_x))
-            if abs(err_x) < 0.10:
+            now = self.get_clock().now().nanoseconds / 1e9
+            elapsed = now - self._align_start_t if self._align_start_t else 0.0
+            if abs(err_x) < 0.10 or elapsed > self.ALIGN_TIMEOUT:
+                if elapsed > self.ALIGN_TIMEOUT:
+                    self.get_logger().warn(f"⚠️  Align timeout ({elapsed:.1f}s) — forcing forward")
                 self.is_aligned = True
         else:
-            target_vx = max(0.0, min(0.3, 0.4 * msg.z))
+            if msg.z > self.tilt_start_dist:
+                # Far: move fast like bottle approach
+                target_vx = max(0.0, min(0.4, 0.6 * (msg.z - self.target_dist)))
+            else:
+                # Close: slow proportional to avoid running over ball
+                target_vx = max(0.0, min(0.15, 0.4 * msg.z))
             target_wz = max(-0.1,  min(0.1,  -0.5 * err_x))
 
         self.current_vx += max(-self.MAX_ACCEL, min(self.MAX_ACCEL, target_vx - self.current_vx))
@@ -580,6 +592,7 @@ class BallChaser(Node):
                 self.stop_robot()
                 self.state = next_state
                 self.is_aligned = False
+                self._align_start_t = self.get_clock().now().nanoseconds / 1e9
                 self.grab_confirm_count = 0
                 self._smooth_x = None
                 self._ball_history.clear()
@@ -659,6 +672,7 @@ class BallChaser(Node):
         self.stop_robot()
         self.current_vx = 0.0
         self.is_aligned = False
+        self._align_start_t = self.get_clock().now().nanoseconds / 1e9
         self.publish_claw(self.CLAW_OPEN)
         self._target_arm_angle = self.ARM_MAX_TILT
         self._arm_step_dir     = -1.0

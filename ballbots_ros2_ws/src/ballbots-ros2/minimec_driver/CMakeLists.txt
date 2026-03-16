@@ -14,6 +14,7 @@ find_package(odrive_can REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(minimec_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(std_srvs REQUIRED)          # ← ADD THIS
 
 add_executable(minimec_driver
         src/minimec_driver.cpp)
@@ -25,6 +26,10 @@ target_link_libraries(minimec_driver PUBLIC
         rclcpp::rclcpp
         sensor_msgs::sensor_msgs_library
         minimeclib::minimeclib
+)
+
+ament_target_dependencies(minimec_driver PUBLIC
+        std_srvs
 )
 
 

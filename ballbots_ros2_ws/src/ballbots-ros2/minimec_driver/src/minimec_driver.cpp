@@ -2,6 +2,7 @@
 /// @brief Forward kinematics implementation for a mecanum wheel robot with robust ODrive startup.
 
 #include <chrono>
+#include <thread>
 #include <functional>
 #include <memory>
 #include <string>
@@ -14,6 +15,7 @@
 #include "odrive_can/msg/controller_status.hpp"
 #include "minimeclib/kinematics.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 using namespace std::chrono_literals;
 
@@ -87,6 +89,11 @@ public:
     client_fr_ = create_client<odrive_can::srv::AxisState>(get_parameter("fr_control_service").as_string());
     client_rr_ = create_client<odrive_can::srv::AxisState>(get_parameter("rr_control_service").as_string());
     client_rl_ = create_client<odrive_can::srv::AxisState>(get_parameter("rl_control_service").as_string());
+
+    client_clear_fl_ = create_client<std_srvs::srv::Trigger>("/odrive_axis0/clear_errors");
+    client_clear_fr_ = create_client<std_srvs::srv::Trigger>("/odrive_axis1/clear_errors");
+    client_clear_rr_ = create_client<std_srvs::srv::Trigger>("/odrive_axis2/clear_errors");
+    client_clear_rl_ = create_client<std_srvs::srv::Trigger>("/odrive_axis3/clear_errors");
 
     // Wait for services to be available (Blocking check at startup)
     waitForServices();
@@ -168,6 +175,16 @@ private:
 
   void enableOdrives()
   {
+    // ← ADD: Clear errors first
+    auto clear_req = std::make_shared<std_srvs::srv::Trigger::Request>();
+    client_clear_fl_->async_send_request(clear_req);
+    client_clear_fr_->async_send_request(clear_req);
+    client_clear_rr_->async_send_request(clear_req);
+    client_clear_rl_->async_send_request(clear_req);
+
+    // ← ADD: Wait 500ms for clear to complete before sending state 1
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
     auto request = std::make_shared<odrive_can::srv::AxisState::Request>();
     request->axis_requested_state = 8; // AXIS_STATE_CLOSED_LOOP_CONTROL
 
@@ -247,6 +264,11 @@ private:
   rclcpp::Client<odrive_can::srv::AxisState>::SharedPtr client_fr_;
   rclcpp::Client<odrive_can::srv::AxisState>::SharedPtr client_rr_;
   rclcpp::Client<odrive_can::srv::AxisState>::SharedPtr client_rl_;
+
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr client_clear_fl_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr client_clear_fr_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr client_clear_rr_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr client_clear_rl_;
 
   rclcpp::TimerBase::SharedPtr timer_;
 

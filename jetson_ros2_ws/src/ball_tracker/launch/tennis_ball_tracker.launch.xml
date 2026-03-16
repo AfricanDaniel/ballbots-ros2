@@ -10,6 +10,12 @@
   />
 
   <arg
+    name="use_zed"
+    default="false"
+    description="true=also launch ZED tracker alongside RealSense"
+  />
+
+  <arg
     name="use_rviz"
     default="false"
     description="Launch RViz visualization"
@@ -80,6 +86,33 @@
     <param name="debug_logs" value="$(var debug_logs)"/>
     <remap from="/tennis_ball_position_close" to="/tennis_ball_position"/>
   </node>
+
+  <!-- ============================= -->
+  <!-- ZED Tracker (optional)        -->
+  <!-- Runs alongside RealSense when -->
+  <!-- use_zed:=true                 -->
+  <!-- ============================= -->
+  <group if="$(var use_zed)">
+    <node
+      pkg="ball_tracker"
+      exec="zed_tracker_yolo"
+      name="zed_tracker_yolo"
+      output="screen"
+      if="$(var use_yolo)"
+    >
+      <param name="debug_logs" value="$(var debug_logs)"/>
+    </node>
+
+    <node
+      pkg="ball_tracker"
+      exec="zed_tracker"
+      name="zed_tracker"
+      output="screen"
+      unless="$(var use_yolo)"
+    >
+      <param name="debug_logs" value="$(var debug_logs)"/>
+    </node>
+  </group>
 
   <!-- ============================= -->
   <!-- RViz (optional) -->

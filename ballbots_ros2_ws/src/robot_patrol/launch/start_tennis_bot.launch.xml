@@ -4,6 +4,9 @@
   <!-- Arguments -->
   <!-- ============================= -->
   <arg name="use_servo" default="true"/>
+  <!-- use_zed:=false → RealSense only (Choice 1, default)   -->
+  <!-- use_zed:=true  → ZED far + RealSense close (Choice 2) -->
+  <arg name="use_zed" default="false"/>
 
   <!-- Shared Config File -->
   <let name="config_file"
@@ -27,6 +30,7 @@
     output="screen">
 
     <param from="$(var config_file)"/>
+    <param name="use_zed" value="$(var use_zed)"/>
   </node>
 
   <!-- ============================= -->

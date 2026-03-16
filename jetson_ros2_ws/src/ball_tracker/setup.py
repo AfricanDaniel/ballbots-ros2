@@ -14,7 +14,8 @@ setup(
          ['launch/tennis_ball_tracker.launch.xml']),
         ('share/' + package_name + '/config',
          ['config/tennis_visualization.rviz']),
-        ('share/' + package_name, ['ball_tracker/best_train_model.pt']),  # ← add this
+        ('share/' + package_name, ['ball_tracker/realsense_best_train_model.pt']),
+        ('share/' + package_name, ['ball_tracker/zed_best_train_model.pt']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,12 +26,11 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'number_publisher = ball_tracker.number_publisher:main',
-            'tennis_ball_tracker = ball_tracker.tennis_ball_tracker:main',
-            'realsense_tracker = ball_tracker.realsense_tracker:main',
-            'bottle_tracker = ball_tracker.bottle_tracker:main',
             'hsv_tuner = ball_tracker.hsv_tuner:main',
+            'realsense_tracker = ball_tracker.realsense_tracker:main',
             'realsense_tracker_yolo = ball_tracker.realsense_tracker_yolo:main',
+            'zed_tracker = ball_tracker.zed_tracker:main',
+            'zed_tracker_yolo = ball_tracker.zed_tracker_yolo:main',
         ],
     },
 )

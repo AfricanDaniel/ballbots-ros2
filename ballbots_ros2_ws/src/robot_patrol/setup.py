@@ -29,9 +29,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'square_move = robot_patrol.square_move:main',
             'ball_chaser = robot_patrol.ball_chaser:main',
-            'servo_test_node = robot_patrol.servo_test_node:main',
             'servo_control = robot_patrol.servo_control:main',
         ],
     },

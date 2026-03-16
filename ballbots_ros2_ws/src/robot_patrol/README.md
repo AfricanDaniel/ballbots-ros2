@@ -7,14 +7,17 @@ ROS2 Python package for autonomous tennis ball retrieval behavior and manual gam
 ### `ball_chaser` — Full Autonomous Mission
 The primary node implementing the complete ball-retrieval mission as a state machine.
 
+- **Parameters:**
+  - `use_zed` (bool, default `false`) — when `false`, `ball_chaser` uses `/tennis_ball_position_close` for all ball chasing (RealSense only); when `true`, it uses `/tennis_ball_position` for far-range (`CHASING_ZED` state) and hands off to `/tennis_ball_position_close` at close range (`CHASING_RS` state).
+
 - **Subscribes:**
-  | Topic | Type | Source |
-  |-------|------|--------|
-  | `/tennis_ball_position` | `geometry_msgs/Point` | ZED tracker (far range) |
-  | `/tennis_ball_position_close` | `geometry_msgs/Point` | RealSense tracker (close range) |
-  | `/bottle_position` | `geometry_msgs/Point` | Bottle tracker |
-  | `/court_pole_position` | `geometry_msgs/Point` | Pole detector |
-  | `/zed/zed_node/odom` | `nav_msgs/Odometry` | ZED visual odometry |
+  | Topic | Type | Active when |
+  |-------|------|-------------|
+  | `/tennis_ball_position` | `geometry_msgs/Point` | `use_zed:=true` — ZED far-range detection |
+  | `/tennis_ball_position_close` | `geometry_msgs/Point` | always — RealSense close-range detection |
+  | `/bottle_position` | `geometry_msgs/Point` | always |
+  | `/court_pole_position` | `geometry_msgs/Point` | always |
+  | `/zed/zed_node/odom` | `nav_msgs/Odometry` | always — ZED visual odometry |
 
 - **Publishes:**
   | Topic | Type | Description |
@@ -125,11 +128,27 @@ These are earlier versions kept for reference and testing:
 
 ### `start_tennis_bot.launch.xml`
 
-Launches hardware drivers and the ball chaser node together.
+Launches the minimec hardware drivers, `ball_chaser`, and optionally `servo_control`.
+
+**Arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `use_servo` | `true` | Launch the servo control node |
+| `use_zed` | `false` | `true` = `ball_chaser` subscribes to ZED ball topics (far range) in addition to RealSense |
 
 ```bash
+# Default — RealSense only
 ros2 launch robot_patrol start_tennis_bot.launch.xml
+
+# RealSense + ZED (must also pass use_zed:=true to tennis_ball_tracker.launch.xml on Jetson)
+ros2 launch robot_patrol start_tennis_bot.launch.xml use_zed:=true
+
+# No servo (e.g. hardware not connected)
+ros2 launch robot_patrol start_tennis_bot.launch.xml use_servo:=false
 ```
+
+> **Important:** `use_zed` must match what is passed to `tennis_ball_tracker.launch.xml` on the Jetson. Mismatching the two will result in `ball_chaser` waiting for topics that nothing is publishing.
 
 ---
 
@@ -152,17 +171,39 @@ robot_patrol:
 
 ---
 
-## Camera Handoff Logic
+## Camera Modes
 
-The robot uses two cameras with a range-based handoff:
+### Mode 1 — RealSense only (default, `use_zed:=false`)
+
+`ball_chaser` skips the `CHASING_ZED` state and goes straight to `CHASING_RS` using `/tennis_ball_position_close` from `realsense_tracker_yolo` (or `realsense_tracker`).
+
+```bash
+# Jetson
+ros2 launch ball_tracker tennis_ball_tracker.launch.xml
+
+# Robot
+ros2 launch robot_patrol start_tennis_bot.launch.xml
+```
+
+### Mode 2 — ZED far + RealSense close (`use_zed:=true`)
+
+`ball_chaser` uses `/tennis_ball_position` (from `zed_tracker_yolo` or `zed_tracker`) for the `CHASING_ZED` state, then hands off to `/tennis_ball_position_close` (RealSense) for the `CHASING_RS` state.
 
 ```
-Ball z > 0.01 m  →  Use ZED (far range, better 3D accuracy)
-Ball z < 0.01 m  →  Use RealSense (close range, handles ZED blind spot)
+Ball z > 0.01 m  →  CHASING_ZED  (ZED far range, better 3D accuracy at distance)
+Ball z < 0.01 m  →  CHASING_RS   (RealSense close range, handles ZED blind spot)
 Ball not visible →  Blind-spot creep (small fixed forward motion)
 ```
 
-The RealSense's `position_close` topic also acts as a trigger signal — when it publishes, the state machine transitions from `CHASING_ZED` to `CHASING_RS`.
+The RealSense's `/tennis_ball_position_close` topic also acts as a trigger signal — when it publishes, the state machine transitions from `CHASING_ZED` to `CHASING_RS`.
+
+```bash
+# Jetson — must match use_zed:=true
+ros2 launch ball_tracker tennis_ball_tracker.launch.xml use_zed:=true
+
+# Robot
+ros2 launch robot_patrol start_tennis_bot.launch.xml use_zed:=true
+```
 
 ---
 

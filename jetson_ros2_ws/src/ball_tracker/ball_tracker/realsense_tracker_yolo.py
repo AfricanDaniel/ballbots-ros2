@@ -56,7 +56,7 @@ class RealSenseTrackerYolo(Node):
         # =====================================================
         # TUNING
         # =====================================================
-        self.CONF_THRESHOLD = 0.1    # minimum detection confidence
+        self.CONF_THRESHOLD = 0.2    # minimum detection confidence
         self.DEPTH_ROI      = 5       # px radius for median depth sample
         self.GRAB_AREA_PX   = 175000  # px² — fallback z when depth is NaN (very close)
 
